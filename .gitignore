@@ -1,0 +1,18 @@
+# Your station's private config (copy station.conf.example -> station.conf)
+station.conf
+
+# Runtime state written by rx-loop / chaser / dashboard
+data/
+*.log
+*.jsonl
+*.adi
+
+# Audio and decoder artifacts
+*.wav
+tools/decoded.txt
+tools/timer.out
+tools/jt9_wisdom.dat
+
+# Python
+__pycache__/
+*.pyc
