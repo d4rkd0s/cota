@@ -10,7 +10,7 @@ run inside `data/` (jt9 litters cwd). Device busy = WSJT-X holding plughw — re
 ## display agent
 Own `bin/dashboard.py` + the HTML. Serve on :8074, stdlib-only python3 (+numpy ok).
 Panels: waterfall (data/waterfall.png, sox-generated per slot), decode table
-(data/decodes.jsonl tail), QSO log (~/.local/share/WSJT-X/wsjtx_log.adi), next-call
+(data/decodes/YYYY-MM-DD/HH.jsonl, hour-rotated — see decode_store.py), QSO log (~/.local/share/WSJT-X/wsjtx_log.adi), next-call
 suggestion (data/status.json). Auto-refresh ≤5 s. Dark theme, readable at a glance.
 
 ## sequencer agent (v1 — design only until TX is signed off)

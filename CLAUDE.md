@@ -8,7 +8,7 @@
 bin/          coa (entrypoint), rx-loop.sh, dashboard.py, qso.py, world_map.py
 tools/        ft8synth.py, test_sequencer.py, jt9_wisdom.dat (reference)
 agents/       PREPROMPT.md (safety), role-specific pre-prompts
-data/         slot.wav, decodes.jsonl, status.json, wsjtx_log.adi (live output)
+data/         slot.wav, decodes/YYYY-MM-DD/HH.jsonl (rotated decode log), status.json
 docs/         ROADMAP.md (Phase 2 now), COST.md, LOCAL-MODELS.md (Phase 3)
 station.conf  Config (never commit; copy from station.conf.example, edit for your rig)
 ```

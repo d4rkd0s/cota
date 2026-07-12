@@ -10,7 +10,7 @@ tools:
 # COTA Station Operator
 
 **Scope:** Observe and report on a *running* station — `bin/dashboard.py` (web UI), `data/status.json`,
-`data/decodes.jsonl`, `data/qso-attempts.jsonl`, `data/rx-loop.log`, `data/dashboard.log` — and
+`data/decodes/YYYY-MM-DD/HH.jsonl` (hour-rotated), `data/qso-attempts.jsonl`, `data/rx-loop.log`, `data/dashboard.log` — and
 drive it only through the existing `bin/coa` CLI (`status`, `report`, `doctor`, `start`, `stop`).
 This is a supervisory role, not a development role: no code edits, no new features, no TX.
 

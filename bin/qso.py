@@ -9,19 +9,21 @@ before EVERY key-up; abort on any mismatch; PTT release verified after every fra
 Usage: qso.py --max-qsos 1
 Events print to stdout (one line each) for live monitoring.
 """
-import sys, os, time, json, re, subprocess, argparse, datetime, collections
+import sys, os, time, json, re, subprocess, argparse, datetime, collections, calendar
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ft8synth
 import station_config
+import decode_store
 
 _C = station_config.load()          # station.conf; every key optional
 DATA    = os.path.expanduser(_C.get("DATA", os.path.join(_ROOT, "data")))
-DECODES = os.path.join(DATA, "decodes.jsonl")
 ADIF    = os.path.expanduser(_C.get("ADIF", "~/.local/share/WSJT-X/wsjtx_log.adi"))
 QSOLOG  = os.path.join(DATA, "qso-attempts.jsonl")
+TARGET_REQ = os.path.join(DATA, "target-request.json")   # written by dashboard.py's "pick" chip
+SKIP_REQ   = os.path.join(DATA, "skip-request.json")     # written by dashboard.py's "Skip current target"
 CAT     = _C.get("CAT_PORT", "/dev/ttyUSB0")
 RIGCTL  = ["rigctl", "-m", _C.get("RIG_MODEL", "3060"), "-r", CAT,
            "-s", _C.get("CAT_BAUD", "19200")]
@@ -44,7 +46,13 @@ def ev(msg):
 # ---- engine state observer (display only — no engine logic reads this) ----
 ENGINE_JSON = os.path.join(DATA, "engine.json")
 _engine = {"utc": "", "state": "init", "target": None, "grid": None,
-           "tx": False, "msg": None, "offset": None}
+           "tx": False, "msg": None, "offset": None, "next_tx_epoch": None,
+           # tx_msg/tx_offset: the actual FT8 content of the last real (or
+           # about-to-happen) transmission, for the dashboard's TX-transparency
+           # panel. Deliberately separate from "msg" above, which doubles as a
+           # transient status/reason string (also used for tx_abort reasons) —
+           # tx_msg must never show a stale abort reason as if it were content.
+           "tx_msg": None, "tx_offset": None}
 
 def write_engine_state(**kw):
     """Publish engine state for the dashboard map. Atomic (tmp + os.replace);
@@ -138,16 +146,75 @@ def is_target_cq(msg, target):
     return p[:1] == ["CQ"] and target.upper() in p[1:]
 
 def read_decodes(from_line):
+    """Same (total_line_count, new_records) contract as always — callers'
+    line-cursor math is unchanged. Only the source changed: hour-bucketed
+    files under data/decodes/ (today's UTC date) instead of one flat file;
+    see decode_store.py. Scoped to today because a chase session never spans
+    more than one UTC day in practice, which also bounds this read instead of
+    re-reading the station's entire history every poll."""
+    today = time.strftime("%y%m%d", time.gmtime())
+    lines = decode_store.read_all(DATA, since_date_yymmdd=today)
     out = []
+    for l in lines[from_line:]:
+        try: out.append(json.loads(l))
+        except json.JSONDecodeError: pass
+    return len(lines), out
+
+def select_target(cqs, requested_call):
+    """Choose which CQ to answer this cycle. `cqs` is this cycle's list of
+    (decode, call, grid) tuples, ALREADY filtered by cq_answerable()/SNR_FLOOR
+    and sorted best-first by the caller's SNR/pileup ranking. If the operator
+    requested a specific call (dashboard "pick" chip) and it's among this
+    cycle's answerable CQs, honor that pick over the automatic ranking;
+    otherwise fall back to the auto-picked best candidate (cqs[0]). Pure —
+    deliberately only chooses among candidates that already passed the
+    etiquette/SNR-floor filters, so a manual pick can never bypass them."""
+    if requested_call:
+        for c in cqs:
+            if c[1] == requested_call:
+                return c
+    return cqs[0]
+
+
+def skip_is_requested(request_ts_epoch, since_epoch):
+    """True when a skip-request's timestamp is at/after `since_epoch` — i.e.
+    issued during (not before) the current target pursuit. Pure; guards
+    against a stale skip click (aimed at a PREVIOUS target) instantly
+    aborting a brand new one that only just started."""
+    return request_ts_epoch is not None and request_ts_epoch >= since_epoch
+
+
+def _read_json(path):
     try:
-        with open(DECODES) as f:
-            lines = f.readlines()
-        for l in lines[from_line:]:
-            try: out.append(json.loads(l))
-            except json.JSONDecodeError: pass
-        return len(lines), out
-    except FileNotFoundError:
-        return 0, []
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _read_target_request():
+    """Requested callsign from the dashboard's "pick" chip, or "" if none/
+    unreadable. Never raises — a malformed/missing request file just means
+    no manual pick this cycle, not a chaser crash."""
+    obj = _read_json(TARGET_REQ)
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("call", "")).strip().upper()
+
+
+def _read_skip_ts_epoch():
+    """Epoch seconds of the last skip-request, or None if none/unreadable."""
+    obj = _read_json(SKIP_REQ)
+    if not isinstance(obj, dict):
+        return None
+    ts = obj.get("ts")
+    if not ts:
+        return None
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
 
 def worked_calls():
     """Callsigns already worked TODAY (UTC) — dupe rule: no same-call dupes per day."""
@@ -209,36 +276,63 @@ def synth_wav(msg, f0, path):
     w.setnchannels(1); w.setsampwidth(2); w.setframerate(ft8synth.RATE)
     w.writeframes((audio * 32767).astype("<i2").tobytes()); w.close()
 
+def compute_tx_boundary(t, our_parity):
+    """Next slot-start epoch (multiple of 15) with parity == our_parity —
+    joins the current slot immediately if we're within the first 1.8 s of a
+    same-parity slot (decoders still accept a slightly-late start), otherwise
+    schedules the next matching-parity slot. Pure extraction of transmit()'s
+    scheduling math, no behavior change; see tools/test_sequencer.py."""
+    sl = slot_start(t)
+    if parity(sl) == our_parity and (t - sl) < 1.8:
+        return sl                           # join the current slot immediately
+    boundary = sl + 15
+    while parity(boundary) != our_parity:
+        boundary += 15
+    return boundary
+
+
+def _tx_waterfall(wav):
+    """Best-effort spectrogram of the TX audio we're about to send, for the
+    dashboard's TX-transparency panel. Display-only: never raises, never
+    blocks TX meaningfully (small file, tight timeout) — a glitch here must
+    never touch the TX safety chain below."""
+    try:
+        subprocess.run(["sox", wav, "-n", "spectrogram", "-x", "900", "-y", "257",
+                         "-z", "70", "-l", "-o", os.path.join(DATA, "tx_waterfall.png")],
+                        capture_output=True, timeout=3)
+    except Exception:
+        pass
+
+
 def transmit(msg, f0, tx_count, our_parity):
     """One frame in OUR parity slot only. Late start allowed up to 1.8 s into the
     slot (decoders accept it); otherwise waits for our next parity slot."""
     if tx_count[msg] >= MAX_REPEAT:
         ev(f"ABORT: '{msg}' hit the {MAX_REPEAT}-repeat cap")
+        write_engine_state(state="tx_abort", msg=f"repeat cap ({MAX_REPEAT}x): {msg}", next_tx_epoch=None)
         return False
     wav = os.path.join(DATA, "tx.wav")
     synth_wav(msg, f0, wav)
+    _tx_waterfall(wav)
     f = rig("f")
     if f != str(DIAL):
         ev(f"ABORT TX: dial reads {f}, expected {DIAL} — NOT keying")
+        write_engine_state(state="tx_abort", msg=f"dial mismatch: reads {f}, expected {DIAL}", next_tx_epoch=None)
         return False
     # choose the key-up moment: our-parity slot, on time or <=1.8 s late
-    t = now(); sl = slot_start(t)
-    if parity(sl) == our_parity and (t - sl) < 1.8:
-        boundary = sl                       # join the current slot immediately
-    else:
-        boundary = sl + 15
-        while parity(boundary) != our_parity:
-            boundary += 15
+    boundary = compute_tx_boundary(now(), our_parity)
     if parity(boundary) != our_parity:      # belt and suspenders
         ev("ABORT TX: could not schedule a slot with our parity")
+        write_engine_state(state="tx_abort", msg="scheduling failed", next_tx_epoch=None)
         return False
+    write_engine_state(next_tx_epoch=boundary, msg=msg, offset=f0, tx_msg=msg, tx_offset=f0)
     wd = subprocess.Popen(["bash", "-c",
         f"sleep {WATCHDOG_S + max(0, boundary - now()):.1f}; " +
         " ".join(RIGCTL) + " T 0 >/dev/null 2>&1"])
     time.sleep(max(0, boundary - 0.7 - now()))
     rig("T", "1")
     ev(f"TX #{sum(tx_count.values())+1} '{msg}' @ {f0} Hz ({tx_count[msg]+1}x this msg, ~13.5 s keyed)")
-    write_engine_state(tx=True, msg=msg, offset=f0)
+    write_engine_state(tx=True, msg=msg, offset=f0, next_tx_epoch=None, tx_msg=msg, tx_offset=f0)
     subprocess.run(["paplay", f"--device={SINK}", wav])
     rig("T", "0")
     wd.terminate()
@@ -248,6 +342,7 @@ def transmit(msg, f0, tx_count, our_parity):
     tx_count[msg] += 1
     if ptt != "0":
         ev("ABORT: PTT did not release!")
+        write_engine_state(state="tx_abort", msg="PTT did not release!")
         return False
     return True
 
@@ -401,7 +496,8 @@ def main():
                         if r["msg"].startswith(c + " ") and len(r["msg"].split()) >= 2
                         and r["msg"].split()[1] != MYCALL})
         cqs.sort(key=lambda x: -(x[0]["snr"] - 6 * competitors(x[1])))
-        d, call, grid = cqs[0]
+        requested = _read_target_request()
+        d, call, grid = select_target(cqs, requested)
         their_parity = slot_parity_of(d["slot"])
         our_parity = 1 - their_parity
         _, recent = read_decodes(max(0, line_pos - 80))
@@ -409,6 +505,7 @@ def main():
         ev(f"TARGET {call} {grid} (CQ {d['snr']} dB @ {d['freq']} Hz, their parity {'even' if their_parity==0 else 'odd'}) -> our offset {f0} Hz (gap {gap} Hz)")
         write_engine_state(state="calling", target=call, grid=grid, offset=f0)
         tried.add(call)
+        target_start_ts = now()
         tx_count = __import__("collections").defaultdict(int)
         report_to_them = f"{d['snr']:+03d}"
 
@@ -422,6 +519,10 @@ def main():
         their_freq = d["freq"]
         answered_f0 = None        # offset that actually got through (sticky once answered)
         while state not in ("done", "fail"):
+            if skip_is_requested(_read_skip_ts_epoch(), target_start_ts):
+                ev(f"skip requested for {call} — abandoning target")
+                state = "fail"
+                break
             # wait until we are inside their slot (they talk), then TX on ours
             if state == "call":  msg = f"{call} {MYCALL} {MYGRID}"
             elif state == "rrpt": msg = f"{call} {MYCALL} R{report_to_them}"

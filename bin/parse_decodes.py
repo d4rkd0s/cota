@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Parse jt9 stdout for one slot -> append decodes.jsonl, rebuild status.json.
-Usage: parse_decodes.py YYMMDD HHMMSS < jt9out.txt   (run from data/)"""
+"""Parse jt9 stdout for one slot -> append to the hour-bucketed decode log,
+rebuild status.json. Usage: parse_decodes.py YYMMDD HHMMSS < jt9out.txt
+(run from data/). Decodes land in decodes/<YYYY-MM-DD>/<HH>.jsonl — see
+decode_store.py; nothing reads the old flat decodes.jsonl anymore."""
 import sys, re, json, time, os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import station_config
+import decode_store
 
 _C = station_config.load()
 DATE = sys.argv[1] if len(sys.argv) > 1 else time.strftime("%y%m%d", time.gmtime())
@@ -12,27 +15,31 @@ SLOT = sys.argv[2] if len(sys.argv) > 2 else time.strftime("%H%M%S", time.gmtime
 ADIF = os.path.expanduser(_C.get("ADIF", "~/.local/share/WSJT-X/wsjtx_log.adi"))
 MYCALL = _C.get("MYCALL", "N0CALL")
 
-line_re = re.compile(r"^\s*(\d{4,6})\s+(-?\d+)\s+(-?[\d.]+)\s+(\d+)\s+\S\s+(.+?)\s*$")
+# jt9's own leading time column is a placeholder ("000000") for every decode
+# in this pipeline — the raw slot.wav carries no real start-time metadata for
+# jt9 to read it from — so it's matched (to split the line correctly) but not
+# kept. DATE+SLOT (this wrapper's own real UTC clock read at capture time,
+# 15 s resolution) is the trustworthy timestamp; see the "ts" field below.
+line_re = re.compile(r"^\s*\d{4,6}\s+(-?\d+)\s+(-?[\d.]+)\s+(\d+)\s+\S\s+(.+?)\s*$")
+TS = decode_store.timestamp(DATE, SLOT)
 decodes = []
 for line in sys.stdin:
     m = line_re.match(line)
     if not m:
         continue
-    t, snr, dt, freq, msg = m.groups()
-    decodes.append({"date": DATE, "slot": SLOT, "t": t, "snr": int(snr),
+    snr, dt, freq, msg = m.groups()
+    decodes.append({"date": DATE, "slot": SLOT, "ts": TS, "snr": int(snr),
                     "dt": float(dt), "freq": int(freq), "msg": msg})
 
-with open("decodes.jsonl", "a") as f:
-    for d in decodes:
-        f.write(json.dumps(d) + "\n")
+decode_store.append(".", DATE, SLOT, decodes)
 
 # recent decodes (last 60)
 recent = []
-try:
-    with open("decodes.jsonl") as f:
-        recent = [json.loads(l) for l in f.readlines()[-60:]]
-except FileNotFoundError:
-    pass
+for l in decode_store.tail(".", 60):
+    try:
+        recent.append(json.loads(l))
+    except json.JSONDecodeError:
+        pass
 
 # worked calls from the WSJT-X ADIF log
 worked, qsos = set(), []

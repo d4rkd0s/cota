@@ -21,7 +21,7 @@ G90 ──DE-19──> PulseAudio source ──parecord 12 kHz──> data/slots
                      jt9 -8 (WSJT-X CLI decoder — best sensitivity)
                      sox spectrogram → data/waterfall.png
                                         │
-                     bin/rx-loop.sh → data/decodes.jsonl + data/status.json
+                     bin/rx-loop.sh → data/decodes/YYYY-MM-DD/HH.jsonl + data/status.json
                                         │
                      bin/dashboard.py (http://localhost:8074) ← Logan's browser
 ```
@@ -50,7 +50,7 @@ or a small state machine; the display's "next call" column is the human-approval
 - `bin/rx-loop.sh` — aligned capture → decode → waterfall → status, forever
 - `bin/dashboard.py` — the display server (port 8074)
 - `bin/start.sh` — start display + rx loop; `bin/stop.sh` — stop both
-- `data/` — slot.wav, waterfall.png, decodes.jsonl, status.json (runtime, gitignore-class)
+- `data/` — slot.wav, waterfall.png, decodes/YYYY-MM-DD/HH.jsonl (rotated), status.json (runtime, gitignore-class)
 
 ## Status
 

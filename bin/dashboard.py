@@ -25,8 +25,30 @@ ACTIONS_LOG = os.path.join(DATA, "actions.log")
 LAYOUT_JSON = os.path.join(DATA, "ui-layout.json")
 TARGET_REQ = os.path.join(DATA, "target-request.json")
 SKIP_REQ = os.path.join(DATA, "skip-request.json")
+ANTENNAS_JSON = os.path.join(DATA, "antennas.json")
 EVENT_LINES = 20
 MAX_POST_BODY = 65536
+
+# General-class HF data sub-bands (CLAUDE.md's own table) mapped to the
+# community-standard FT8 calling frequency for each — band/freq selection in
+# the dashboard is LOCKED to this list (no free-form Hz entry). 60 m excluded
+# on purpose: it's channelized with its own mode/power rules that get revised
+# more often than the rest of the band plan (see skills/antenna-atu.md) — pick
+# it by hand and edit station.conf directly rather than trusting a baked-in
+# channel list here.
+BANDS = {
+    "160m": {"freq_hz": 1840000,  "cap_w": None},
+    "80m":  {"freq_hz": 3573000,  "cap_w": None},
+    "40m":  {"freq_hz": 7074000,  "cap_w": None},
+    "30m":  {"freq_hz": 10136000, "cap_w": 200},   # §97.313: 200 W PEP cap, all classes, no exceptions
+    "20m":  {"freq_hz": 14074000, "cap_w": None},
+    "17m":  {"freq_hz": 18100000, "cap_w": None},
+    "15m":  {"freq_hz": 21074000, "cap_w": None},
+    "12m":  {"freq_hz": 24915000, "cap_w": None},
+    "10m":  {"freq_hz": 28074000, "cap_w": None},
+}
+ABS_MAX_W = 1500      # §97.313 General-class PEP ceiling — sanity backstop only
+DEFAULT_MAX_W = 5      # conservative cap for an antenna with no confirmed RF-exposure-verified max
 
 DRYRUN = os.environ.get("COA_DRYRUN", "") not in ("", "0", "false", "False")
 QSO_PY = os.path.join(_BIN, "qso.py")
@@ -37,7 +59,8 @@ CAT_BAUD = _C.get("CAT_BAUD", "19200")
 
 CONFIG = {"mycall": MYCALL, "mygrid": MYGRID, "band": _C.get("BAND", ""),
           "dial_hz": int(_C.get("DIAL_HZ", "0") or 0),
-          "tx_pwr": _C.get("TX_PWR", ""), "mode": "FT8"}
+          "tx_pwr": _C.get("TX_PWR", ""), "mode": "FT8",
+          "antenna": _C.get("ANTENNA", "")}
 
 PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude — __MYCALL__</title>
 <style>
@@ -60,6 +83,7 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
  #map .dot-rx{r:calc(2.2px * var(--map-scale, 1))}
  #map .dot-home{r:calc(3.5px * var(--map-scale, 1))}
  #map .dot-tx{r:calc(3px * var(--map-scale, 1))}
+ #map .dot-qso{r:calc(3px * var(--map-scale, 1))}
  .txflow{animation:flow 1s linear infinite}
  @keyframes flow{to{stroke-dashoffset:-17}}
  @keyframes pulse{50%{opacity:.35}}
@@ -76,16 +100,63 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
  #cockpit .cpv{font-size:28px;font-weight:800;font-family:ui-monospace,monospace;line-height:1.1}
  #cpState.st-tx,#cpState.tx-live{color:#f85149;animation:pulse 1s ease-in-out infinite}
  #cpState.st-calling{color:#f0883e} #cpState.st-qso{color:#3fb950}
+ #cpState.st-hunting{color:#56d4dd}
  #cpState.st-breather,#cpState.st-idle,#cpState.st-init,#cpState.st-{color:#8b949e}
  #cpNext{color:#3fb950}
+ /* ---- NEXT TX cockpit countdown: idle / counting-down / on-air / aborted ---- */
+ #cpNextTx{color:#8b949e}
+ #cpNextTx.tx-soon{color:#f0883e}
+ #cpNextTx.tx-live{color:#f85149;animation:pulse .6s ease-in-out infinite}
+ #cpNextTx.tx-abort{color:#f85149}
  #cockpit .spacer{flex:1}
- #btnUnkey{background:#f85149;color:#fff;border:none;border-radius:6px;font-size:17px;
-  font-weight:800;padding:14px 22px;cursor:pointer;letter-spacing:.03em}
- #btnUnkey:hover{background:#ff6a61} #btnUnkey:active{background:#da3833}
- #btnUnkey.live{animation:pulse 1s ease-in-out infinite}
+ /* ---- STOP+UNKEY: neutral outline at rest (this is a control, not an alarm);
+    full red + a layered "siren" glow/ring animation ONLY while e.tx===true.
+    Always clickable regardless of visual state — see wireActions(). ---- */
+ #btnUnkey{position:relative;background:#21262d;color:#f85149;border:2px solid #f85149;
+  border-radius:6px;font-size:17px;font-weight:800;padding:14px 22px;cursor:pointer;
+  letter-spacing:.03em;transition:background .15s,color .15s}
+ #btnUnkey:hover{background:#2d1214} #btnUnkey:active{background:#3d1a16}
+ #btnUnkey.live{background:#f85149;color:#fff;border-color:#f85149;
+  animation:sirenGlow 1s ease-in-out infinite}
+ #btnUnkey.live::before,#btnUnkey.live::after{content:'';position:absolute;inset:-3px;
+  border-radius:9px;border:2px solid #f85149;opacity:0;pointer-events:none;
+  animation:sirenRing 1.3s ease-out infinite}
+ #btnUnkey.live::after{animation-delay:.55s}
+ @keyframes sirenGlow{0%,100%{box-shadow:0 0 6px 2px rgba(248,81,73,.5)}50%{box-shadow:0 0 24px 9px rgba(248,81,73,.9)}}
+ @keyframes sirenRing{0%{transform:scale(1);opacity:.75}100%{transform:scale(1.7);opacity:0}}
+ /* ---- TX-capable markers: three tiers, so a glance answers "can this
+    transmit" vs "is this armed" vs "is this transmitting right now":
+    1) .tx-capable — static red outline, permanent property of any control
+       whose click can eventually lead to a real key-up (Chase button).
+    2) .armed — chaser process alive: a transmission could happen any
+       moment once a CQ is found. Steady red widget border.
+    3) .armed.live — engine tx===true, actually keyed this instant: upgrades
+       to the same pulsing siren glow as STOP+UNKEY. ---- */
+ .tx-capable{border-color:#f85149!important;box-shadow:0 0 0 1px rgba(248,81,73,.35)}
+ .widget[data-key=actions].armed{border-color:#f85149;box-shadow:0 0 0 1px rgba(248,81,73,.35);
+  transition:border-color .2s,box-shadow .2s}
+ .widget[data-key=actions].armed.live{animation:sirenGlow 1s ease-in-out infinite}
+ #stChaser.armed{color:#f85149;font-weight:700}
+ #stRx.tx-live{color:#f85149;font-weight:700;animation:pulse .6s ease-in-out infinite}
+ #stRxLabel{color:inherit}
+ /* ---- whole-page "ON AIR" indicator: impossible to miss from across the
+    room, not just a widget detail. A fixed full-viewport glow layer (so it
+    isn't clipped by scrolling content) plus a background tint on <body>
+    itself. Toggled by refreshActionsState() off the same j.ptt used
+    everywhere else -- one source of truth for "are we keyed right now". ---- */
+ body.tx-live{background:#1a0605}
+ body.tx-live::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;
+  box-shadow:inset 0 0 10vw 2vw rgba(248,81,73,.65);animation:pageGlow 1s ease-in-out infinite}
+ @keyframes pageGlow{0%,100%{box-shadow:inset 0 0 8vw 1.5vw rgba(248,81,73,.45)}
+  50%{box-shadow:inset 0 0 14vw 3vw rgba(248,81,73,.85)}}
  #btnBell.active{background:#1f6feb;border-color:#1f6feb;color:#fff}
  #dryrunBanner{background:#3d2f00;color:#e3b341;border:1px solid #6b5300;border-radius:6px;
   padding:4px 10px;font-size:12px;font-weight:700;display:none;margin-bottom:8px}
+ /* ---- TX transparency widget ---- */
+ .widget[data-key=txpanel]{width:420px;height:320px}
+ #txMsg{font-size:19px;font-weight:800;font-family:ui-monospace,monospace;color:#8b949e}
+ #txMsg.tx-live{color:#f85149;animation:pulse 1s ease-in-out infinite}
+ #txAbortMsg{color:#f85149;font-weight:700}
 
  /* ---- widget system ---- */
  #dash{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start}
@@ -112,6 +183,7 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
  .widget[data-key=log]{width:300px;height:220px}
  .widget[data-key=events]{width:880px;height:170px}
  .widget[data-key=actions]{width:300px;height:320px}
+ .widget[data-key=stationcfg]{width:340px;height:420px}
  .widget[data-key=status]{width:100%;height:66px}
 
  .actionbtn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;
@@ -124,17 +196,19 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
   padding:2px 9px;font-size:12px;font-family:ui-monospace,monospace;cursor:pointer;margin:2px 3px 2px 0}
  .callchip:hover{border-color:#56d4dd} .callchip:disabled{opacity:.5;cursor:default}
  .callchip-main{color:#3fb950;border-color:#3fb950}
- select,input[type=number]{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px}
+ select,input[type=number],input[type=text]{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px}
+ details summary{cursor:pointer} details>.arow{margin:6px 0}
 </style></head><body>
 <h1>\U0001F4FB FT8-Claude <small>— __MYCALL__ · __MYGRID__ · RX monitor</small> <span id=stale>⚠ STALE — rx-loop not updating</span></h1>
 <div id=cockpit>
  <div class=cpitem><span class=cpk>STATE</span><span class="cpv st-" id=cpState>—</span></div>
  <div class=cpitem><span class=cpk>BAND</span><span class=cpv id=cpBand>—</span></div>
  <div class=cpitem><span class=cpk>NEXT CALL</span><span class="cpv" id=cpNext>—</span></div>
+ <div class=cpitem><span class=cpk>NEXT TX</span><span class=cpv id=cpNextTx title="countdown to the next scheduled key-up, or ON AIR while transmitting">—</span></div>
  <div class=spacer></div>
- <button id=btnBell class=actionbtn title="desktop alerts: new QSO, chase ended, watchdog/abort, decode silence &gt;3 min">Alerts: OFF</button>
+ <button id=btnBell class=actionbtn title="desktop alerts: new QSO, Automatic CQ ended, watchdog/abort, decode silence &gt;3 min">Alerts: OFF</button>
  <button id=resetLayout class=actionbtn title="restore default widget layout">Reset layout</button>
- <button id=btnUnkey title="kill chaser + rigctl T 0 — no confirmation">STOP + UNKEY</button>
+ <button id=btnUnkey title="stop Automatic CQ + rigctl T 0 — no confirmation">STOP + UNKEY</button>
 </div>
 <div id=dash>
 
@@ -162,41 +236,88 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
   </div>
  </div>
 
- <div class=widget data-key=actions>
+ <div class=widget data-key=txpanel>
+  <div class=wtitle><span class=wname>TX transparency</span><span class=dim id=txPanelSub>no TX yet this session</span><button class=wcollapse></button></div>
+  <div class=wbody>
+   <div class=dim style="margin-bottom:6px">The exact message and audio actually keyed — full visibility, for troubleshooting "why didn't it transmit".</div>
+   <div id=txMsg>—</div>
+   <div id=txAbortMsg style="display:none"></div>
+   <img id=txwf style="display:none;margin-top:8px" src="">
+   <audio id=txAudio controls style="width:100%;margin-top:8px;display:none"></audio>
+  </div>
+ </div>
+
+ <div class=widget data-key=actions id=actionsWidget>
   <div class=wtitle><span class=wname>Actions</span><button class=wcollapse></button></div>
   <div class=wbody>
    <div id=dryrunBanner>DRY-RUN MODE — actions are logged, not executed</div>
    <div class=astatus>
-    <span class=it><span class=k>RX&nbsp;</span><span class=v id=stRx>—</span></span>
-    <span class=it><span class=k>CHASER&nbsp;</span><span class=v id=stChaser>—</span></span>
+    <span class=it><span class=k id=stRxLabel>RX&nbsp;</span><span class=v id=stRx>—</span></span>
+    <span class=it><span class=k>AUTO&nbsp;CQ&nbsp;</span><span class=v id=stChaser>—</span></span>
     <span class=it><span class=k>PTT&nbsp;</span><span class=v id=stPtt>—</span></span>
    </div>
-   <div class=arow><button id=btnRxStart class=actionbtn>Start RX</button>
-    <button id=btnRxStop class=actionbtn>Stop RX</button></div>
+   <div class=dim style="margin-bottom:4px">Receive-only monitoring — no TX is possible in this mode.</div>
+   <div class=arow><button id=btnRxStart class=actionbtn>Start monitoring (RX only)</button>
+    <button id=btnRxStop class=actionbtn>Stand down (stop RX + Automatic CQ)</button></div>
+   <div class=dim style="margin:8px 0 4px">
+    <span class=tx-capable style="border:1px solid;border-radius:4px;padding:1px 5px">TX-capable</span>
+    — starts monitoring automatically if needed, then calls CQs and WILL key the radio when it finds one.
+   </div>
    <div class=arow>
     <input id=chaseN type=number min=1 max=180 value=1>
     <select id=chaseMode><option value=qsos>QSOs</option><option value=minutes>minutes</option></select>
-    <button id=btnChaseStart class="actionbtn warn">Chase</button>
-    <button id=btnChaseStop class=actionbtn>Stop chase</button>
+    <button id=btnChaseStart class="actionbtn warn tx-capable">Automatic CQ</button>
+    <button id=btnChaseStop class=actionbtn>Stop</button>
    </div>
-   <div id=chaseConfirmMsg class=dim style="display:none">You are the control operator — stay at the station.
-    <div class=arow><button id=btnChaseConfirm class="actionbtn warn">Confirm start chase</button>
+   <div id=chaseConfirmMsg class=dim style="display:none">You are the control operator — stay at the
+    station and watch NEXT TX (top center) count down once a CQ is found; FT8 keys up on 15 s cycles.
+    <div class=arow><button id=btnChaseConfirm class="actionbtn warn tx-capable">Confirm start Automatic CQ</button>
      <button id=btnChaseCancel class=actionbtn>Cancel</button></div></div>
    <div class=dim id=actionsMsg></div>
    <div class=dim style="margin-top:6px">STOP + UNKEY is always available, top right — no confirmation, one click.</div>
   </div>
  </div>
 
+ <div class=widget data-key=stationcfg>
+  <div class=wtitle><span class=wname>Station config</span><button class=wcollapse></button></div>
+  <div class=wbody>
+   <div class=dim style="margin-bottom:6px">Band/frequency is locked to the standard FT8 calling
+    frequency for the selected band — no free-form entry. Wattage is capped to the antenna's
+    confirmed RF-exposure-safe max (or a conservative __DEFAULT_MAX_W__ W default if unconfirmed).</div>
+   <div class=arow><select id=antSelect style="flex:1 1 auto"></select></div>
+   <div class=arow><select id=bandSelect style="flex:1 1 auto"></select>
+    <select id=pwrSelect></select></div>
+   <div class=arow><button id=stationSaveBtn class=actionbtn>Save station config</button></div>
+   <div class=dim id=stationMsg></div>
+   <details style="margin-top:8px">
+    <summary class=dim style="cursor:pointer">Add / edit / remove antenna</summary>
+    <div class=arow style="margin-top:6px">
+     <input id=antName type=text placeholder="Antenna name" style="flex:1 1 auto"></div>
+    <div class=arow id=antBandsRow></div>
+    <div class=arow>
+     <input id=antMaxW type=number min=0 max=1500 step=0.5
+      placeholder="max safe W (blank = unconfirmed)" style="flex:1 1 auto"></div>
+    <div class=arow><input id=antNotes type=text placeholder="notes" style="flex:1 1 auto"></div>
+    <div class=arow>
+     <button id=antAddBtn class=actionbtn>Add new</button>
+     <button id=antUpdateBtn class=actionbtn>Update selected</button>
+     <button id=antRemoveBtn class=actionbtn>Remove selected</button>
+    </div>
+    <div class=dim id=antMsg></div>
+   </details>
+  </div>
+ </div>
+
  <div class=widget data-key=map>
   <div class=wtitle><span class=wname>World map</span>
-   <span class=dim style="flex:0 0 auto">heard (cyan) · TX (red) · home (gold)</span>
+   <span class=dim style="flex:0 0 auto">heard (cyan) · QSO worked (green) · TX (red) · home (gold)</span>
    <button id=mapAuto class="actionbtn maptbtn active">Auto</button>
    <button id=mapWorld class="actionbtn maptbtn">World</button>
    <button class=wcollapse></button></div>
   <div class=wbody style="padding:4px">
    <svg id=map viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet">
     <path d="__WORLD__" fill="#1c2430" stroke="#30363d" stroke-width="0.5" vector-effect="non-scaling-stroke"/>
-    <g id=rx></g><g id=tx></g><g id=home></g>
+    <g id=rx></g><g id=qso></g><g id=tx></g><g id=home></g>
    </svg>
   </div>
  </div>
@@ -212,7 +333,9 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
  </div>
 
  <div class=widget data-key=events>
-  <div class=wtitle><span class=wname>Chaser events</span><span class=dim>data/chase.log — engine diary, last __EVENT_LINES__ lines</span><button class=wcollapse></button></div>
+  <div class=wtitle><span class=wname>Automatic CQ events</span><span class=dim>data/chase.log — engine diary, last __EVENT_LINES__ lines</span>
+   <label class=dim style="cursor:pointer"><input type=checkbox id=evRaw> raw</label>
+   <button class=wcollapse></button></div>
   <div class=wbody><pre id=events>no events yet</pre></div>
  </div>
 
@@ -227,10 +350,72 @@ function evClass(l){
 }
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
+/* ---- human-friendly log rendering (display only — chase.log on disk is
+   untouched, this only reformats what's shown in the #events widget). Each
+   pattern below mirrors one of qso.py's ev(...) call sites 1:1; anything
+   that doesn't match a known pattern falls back to the raw line untouched
+   so nothing is ever hidden, just possibly less pretty. ---- */
+const LOG_PATTERNS=[
+ [/^ABORT: '(.+)' hit the (\\d+)-repeat cap$/, m=>`🛑 Giving up on "${m[1]}" — already tried ${m[2]} times`],
+ [/^ABORT TX: dial reads (\\S+), expected (\\S+) — NOT keying$/, m=>`🛑 Radio is on the wrong frequency (reads ${m[1]} Hz, expected ${m[2]} Hz) — refused to transmit`],
+ [/^ABORT TX: could not schedule a slot with our parity$/, ()=>`🛑 Couldn't schedule a transmit slot — aborted`],
+ [/^ABORT: PTT did not release!$/, ()=>`🛑 PTT did not release after transmitting — check the radio`],
+ [/^ABORT: PTT not idle at start$/, ()=>`🛑 Radio was already transmitting at startup — refused to begin`],
+ [/^TX #(\\d+) '(.+)' @ (\\d+) Hz \\(\\d+x this msg, ~13\\.5 s keyed\\)$/, m=>`📡 Transmitting #${m[1]}: "${m[2]}" @ ${m[3]} Hz`],
+ [/^unkeyed, PTT verify: (\\S+)$/, m=>m[1]==='0'?`🔇 Unkeyed — radio confirmed off air`:`⚠️ Unkeyed, but PTT still reads "${m[1]}" — check the radio`],
+ [/^LOGGED QSO: (\\S+) (\\S+) sent (\\S+) rcvd (\\S+) -> wsjtx_log\\.adi$/, m=>`✅ QSO logged: ${m[1]} (${m[2]}) — sent ${m[3]}, received ${m[4]}`],
+ [/^session report written: (.+)$/, ()=>`📝 Session report saved`],
+ [/^WARN: could not write session report: (.+)$/, m=>`⚠️ Couldn't save session report: ${m[1]}`],
+ [/^chaser start: target (\\d+) QSO\\(s\\)(?: \\/ ([\\d.]+) min budget)?, dial (\\d+), watchdog ([\\d.]+)s, repeat cap (\\d+)$/,
+  m=>`▶️ Automatic CQ started — aiming for ${m[1]} QSO(s)${m[2]?` / ${m[2]} min budget`:''}, dial ${(m[3]/1e6).toFixed(3)} MHz`],
+ [/^time budget reached: (\\d+) QSO\\(s\\) in ([\\d.]+) min$/, m=>`⏱️ Time's up — ${m[1]} QSO(s) completed in ${m[2]} min`],
+ [/^stopping: (\\d+) targets tried, (\\d+) completed$/, m=>`⏹️ Stopping — tried ${m[1]} stations, completed ${m[2]}`],
+ [/^skip CQ (\\S+) (\\S+) — directed CQ not for us$/, m=>`⏭️ Skipped ${m[2]} — CQ was directed elsewhere (${m[1]})`],
+ [/^skip (\\S+) at (-?\\d+) dB — below SNR floor (-?\\d+) \\(reciprocity\\)$/, m=>`⏭️ Skipped ${m[1]} — too weak (${m[2]} dB, need ${m[3]}+)`],
+ [/^TARGET (\\S+) (\\S*) \\(CQ (-?\\d+) dB @ (\\d+) Hz, their parity (even|odd)\\) -> our offset (\\d+) Hz \\(gap (\\d+) Hz\\)$/,
+  m=>`🎯 Targeting ${m[1]}${m[2]?` (${m[2]})`:''} — heard at ${m[3]} dB, calling on ${m[6]} Hz`],
+ [/^skip requested for (\\S+) — abandoning target$/, m=>`⏭️ You skipped ${m[1]} — moving on`],
+ [/^busy-hold: (\\S+) working someone else — skipping our tx cycle \\((\\d+)\\/4\\)$/, m=>`⏸️ ${m[1]} is busy with someone else — waiting (${m[2]}/4)`],
+ [/^(\\S+) flipped slot parity \\((\\d+) Hz\\) — we now tx on (even|odd) slots$/, m=>`🔄 ${m[1]} switched timing — now transmitting on ${m[3]} slots`],
+ [/^ANSWERED: (\\S+) gives us (\\S+) -> sending R(\\S+)$/, m=>`✅ ${m[1]} answered! They report ${m[2]} — sending our reply`],
+ [/^(\\S+) sends (\\S+) — QSO complete, sending courtesy 73$/, m=>`✅ ${m[1]} confirmed — QSO complete, sending 73`],
+ [/^(\\S+) is CQing again — he lost our R-report; moving (\\d+) -> (\\d+) Hz \\(gap (\\d+) Hz\\), still sending R(\\S+)$/,
+  m=>`🔄 ${m[1]} didn't get our reply — retrying on ${m[3]} Hz`],
+ [/^(\\S+): R-report never acknowledged after (\\d+) cycles — giving up$/, m=>`🛑 ${m[1]} never confirmed our reply after ${m[2]} tries — giving up`],
+ [/^(\\S+) is reporting to someone else mid-QSO — aborting target$/, m=>`🛑 ${m[1]} switched to another station mid-QSO — giving up`],
+ [/^(\\S+) still busy after 4 skipped cycles — moving on$/, m=>`⏭️ ${m[1]} still busy after waiting — moving on`],
+ [/^no answer at (\\d+) Hz after 3 calls — new clear offset (\\d+) Hz \\(gap (\\d+) Hz\\)$/, m=>`🔄 No answer at ${m[1]} Hz after 3 tries — trying ${m[2]} Hz instead`],
+ [/^no response from (\\S+) after 6 calls on 2 offsets — moving on$/, m=>`⏭️ No response from ${m[1]} after 6 tries on 2 frequencies — moving on`],
+ [/^no response from (\\S+) after (\\d+) tries in state '(\\w+)' — moving on$/, m=>`⏭️ No response from ${m[1]} after ${m[2]} tries — moving on`],
+ [/^target (\\S+): (done|fail) \\(completed (\\d+)\\/(\\d+)\\)$/,
+  m=>m[2]==='done'?`✅ ${m[1]}: done — ${m[3]}/${m[4]} QSOs this run`:`❌ ${m[1]}: no contact — ${m[3]}/${m[4]} QSOs this run`],
+ [/^breather: sitting out one 15 s cycle \\((\\d+) s keyed this session\\)$/, m=>`☕ Taking a short breather (${m[1]}s keyed so far)`],
+ [/^DONE: (\\d+) QSO\\(s\\) completed and logged\\. PTT: (\\S+)$/, m=>`🏁 Finished — ${m[1]} QSO(s) completed and logged`],
+];
+function humanizeLogLine(raw){
+ const tm=raw.match(/^(\\d{2}:\\d{2}:\\d{2}) (.*)$/);
+ const ts=tm?tm[1]+'Z':null, rest=tm?tm[2]:raw;
+ for(const [re,fn] of LOG_PATTERNS){
+  const m=rest.match(re);
+  if(m) return (ts?ts+'  ':'')+fn(m);
+ }
+ return ts?ts+'  '+rest:rest;
+}
+let lastEventLines=[];
+function renderEvents(){
+ const el=document.getElementById('events');
+ const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<30;
+ const raw=document.getElementById('evRaw').checked;
+ el.innerHTML=lastEventLines.length
+  ? lastEventLines.map(l=>`<span class="${evClass(l)}">${esc(raw?l:humanizeLogLine(l))}</span>`).join('\\n')
+  : 'no events yet';
+ if(atBottom) el.scrollTop=el.scrollHeight;
+}
+
 /* ---- world map ---- */
 const MW=1000, MH=500;
 let HOME=null, CFG=null;
-let mapPoints={rx:[], tx:null};
+let mapPoints={rx:[], tx:null, qso:[]};
 function grid2ll(g){                       // Maidenhead 4/6-char -> [lat,lon] (cell center)
  g=(g||'').trim().toUpperCase();
  if(!/^[A-R]{2}[0-9]{2}([A-X]{2})?$/.test(g)) return null;
@@ -286,6 +471,7 @@ function computeBBox(){
  const pts=[];
  if(HOME) pts.push(HOME);
  for(const p of mapPoints.rx) pts.push(p);
+ for(const p of mapPoints.qso) pts.push(p);
  if(mapPoints.tx) pts.push(mapPoints.tx);
  if(!pts.length) return {x:0,y:0,w:MW,h:MH};
  let minX=Math.min.apply(null,pts.map(p=>p[0])), maxX=Math.max.apply(null,pts.map(p=>p[0]));
@@ -330,6 +516,114 @@ async function loadCfg(){
    `<span class=it><span class=k>${i[0]}</span><span class=v>${esc(String(i[1]))}</span></span>`).join('');
  }catch(e){}
 }
+
+/* ---- Station config widget: antenna CRUD + band/wattage selection, LOCKED
+   to the server's BANDS table and each antenna's own max_watts — this page
+   never lets the operator type a raw Hz or an unbounded watt value. Saving
+   only writes station.conf; it never touches the CAT port (no retune, no
+   TX) — see /action/station/set's docstring in dashboard.py. ---- */
+let ANTENNAS=[], BANDS_CACHE=[];
+function bandLabel(b){
+ return `${b.name} — ${(b.freq_hz/1e6).toFixed(3)} MHz (FT8)`+(b.cap_w?` [legal cap ${b.cap_w} W]`:'');
+}
+async function loadBands(){
+ try{ const r=await fetch('/bands'); if(r.ok) BANDS_CACHE=await r.json(); }catch(e){}
+}
+function currentAntenna(){
+ return ANTENNAS.find(a=>a.id===document.getElementById('antSelect').value);
+}
+function refreshBandOptions(){
+ const a=currentAntenna(), sel=document.getElementById('bandSelect');
+ const want=CFG.band||sel.value;
+ const opts=BANDS_CACHE.filter(b=>!a||a.bands.includes(b.name));
+ sel.innerHTML=opts.map(b=>`<option value="${b.name}">${bandLabel(b)}</option>`).join('');
+ if(want && opts.some(b=>b.name===want)) sel.value=want;
+}
+function refreshPwrOptions(){
+ const a=currentAntenna();
+ const band=BANDS_CACHE.find(b=>b.name===document.getElementById('bandSelect').value);
+ let cap=(a&&a.max_watts)?a.max_watts:__DEFAULT_MAX_W__;
+ if(band&&band.cap_w) cap=Math.min(cap,band.cap_w);
+ const steps=[1,2,5,10,15,20,25,30,50,75,100,150,200,300,500,1000,1500].filter(w=>w<=cap);
+ if(!steps.length) steps.push(cap);
+ const sel=document.getElementById('pwrSelect');
+ const want=parseFloat(CFG.tx_pwr)||parseFloat(sel.value);
+ sel.innerHTML=steps.map(w=>`<option value="${w}">${w} W</option>`).join('');
+ if(steps.includes(want)) sel.value=want; else sel.value=steps[steps.length-1];
+}
+function onAntennaChange(){
+ refreshBandOptions(); refreshPwrOptions();
+ const a=currentAntenna();
+ document.getElementById('antName').value=a?a.name:'';
+ document.getElementById('antMaxW').value=(a&&a.max_watts)?a.max_watts:'';
+ document.getElementById('antNotes').value=(a&&a.notes)?a.notes:'';
+ document.querySelectorAll('#antBandsRow input[type=checkbox]').forEach(cb=>{
+  cb.checked=!!(a&&a.bands.includes(cb.value));
+ });
+}
+function buildAntBandsRow(){
+ document.getElementById('antBandsRow').innerHTML=BANDS_CACHE.map(b=>
+  `<label class=dim style="margin-right:8px"><input type=checkbox value="${b.name}"> ${b.name}</label>`).join('');
+}
+async function loadAntennas(preserveSel){
+ try{
+  const r=await fetch('/antennas'); if(!r.ok) return;
+  ANTENNAS=await r.json();
+  const sel=document.getElementById('antSelect');
+  const want=preserveSel||CFG.antenna||sel.value||(ANTENNAS[0]&&ANTENNAS[0].id);
+  sel.innerHTML=ANTENNAS.map(a=>
+   `<option value="${a.id}">${esc(a.name)}${a.max_watts?` (max ${a.max_watts} W)`:' (max W unconfirmed)'}</option>`).join('');
+  if(want && ANTENNAS.some(a=>a.id===want)) sel.value=want;
+  onAntennaChange();
+ }catch(e){}
+}
+function wireStationCfg(){
+ document.getElementById('antSelect').addEventListener('change',onAntennaChange);
+ document.getElementById('bandSelect').addEventListener('change',refreshPwrOptions);
+ document.getElementById('stationSaveBtn').addEventListener('click',async()=>{
+  const antenna_id=document.getElementById('antSelect').value;
+  const band=document.getElementById('bandSelect').value;
+  const tx_pwr=parseFloat(document.getElementById('pwrSelect').value);
+  const msg=document.getElementById('stationMsg');
+  if(!antenna_id||!band){ msg.textContent='pick an antenna and band first'; return; }
+  msg.textContent='saving…';
+  const r=await postAction('/action/station/set',{antenna_id,band,tx_pwr});
+  msg.textContent=r.ok?(r.body.note||'saved'):('save failed: '+(r.body.error||r.error||r.status));
+  if(r.ok){ CFG.antenna=antenna_id; CFG.band=band; CFG.tx_pwr=String(tx_pwr); CFG.dial_hz=r.body.dial_hz; loadCfg(); }
+ });
+ function antFields(){
+  return {
+   name: document.getElementById('antName').value.trim(),
+   bands: [...document.querySelectorAll('#antBandsRow input[type=checkbox]:checked')].map(c=>c.value),
+   max_watts: document.getElementById('antMaxW').value===''?null:parseFloat(document.getElementById('antMaxW').value),
+   notes: document.getElementById('antNotes').value.trim(),
+  };
+ }
+ document.getElementById('antAddBtn').addEventListener('click',async()=>{
+  const f=antFields(), msg=document.getElementById('antMsg');
+  if(!f.name||!f.bands.length){ msg.textContent='name and at least one band required'; return; }
+  const r=await postAction('/action/antenna/add',f);
+  msg.textContent=r.ok?'added':'add failed: '+(r.body.error||r.error||r.status);
+  if(r.ok) loadAntennas(r.body.antenna.id);
+ });
+ document.getElementById('antUpdateBtn').addEventListener('click',async()=>{
+  const id=document.getElementById('antSelect').value, f=antFields(), msg=document.getElementById('antMsg');
+  if(!id){ msg.textContent='select an antenna first'; return; }
+  if(!f.name||!f.bands.length){ msg.textContent='name and at least one band required'; return; }
+  const r=await postAction('/action/antenna/update',{id,...f});
+  msg.textContent=r.ok?'updated':'update failed: '+(r.body.error||r.error||r.status);
+  if(r.ok) loadAntennas(id);
+ });
+ document.getElementById('antRemoveBtn').addEventListener('click',async()=>{
+  const id=document.getElementById('antSelect').value, msg=document.getElementById('antMsg');
+  if(!id){ msg.textContent='select an antenna first'; return; }
+  const r=await postAction('/action/antenna/remove',{id});
+  msg.textContent=r.ok?('removed'+(r.body.was_active?' (was the active antenna — pick a new one and Save)':'')):
+   'remove failed: '+(r.body.error||r.error||r.status);
+  if(r.ok) loadAntennas();
+ });
+}
+
 function renderRX(s){
  if(!HOME) return;
  const seen={};                            // dedupe by callsign, keep newest
@@ -358,6 +652,25 @@ function renderRX(s){
  mapPoints.rx=pts;
  updateMapZoom();
 }
+/* ---- completed QSOs this session: persistent green lines, unlike the
+   fading cyan "heard" traffic above — these are confirmed contacts, the
+   actual thing being gathered, so they never fade/expire within a session. ---- */
+function renderQSOs(s){
+ if(!HOME) return;
+ let h=''; const pts=[];
+ for(const q of s.qsos||[]){
+  if(!q.grid||!isGrid(q.grid)) continue;
+  const ll=grid2ll(q.grid); if(!ll) continue;
+  const [x,y]=ll2xy(ll);
+  pts.push([x,y]);
+  h+=`<line x1="${HOME[0]}" y1="${HOME[1]}" x2="${x}" y2="${y}" stroke="#3fb950" stroke-width="1.1" opacity="0.7" vector-effect="non-scaling-stroke"/>`;
+  h+=`<circle class=dot-qso cx="${x}" cy="${y}" fill="#3fb950" stroke="#0d1117" stroke-width="0.6" vector-effect="non-scaling-stroke"/>`;
+  h+=`<text x="${x+6}" y="${y-6}" class=mlabel fill="#3fb950">${esc(q.call||'')}</text>`;
+ }
+ document.getElementById('qso').innerHTML=h;
+ mapPoints.qso=pts;
+ updateMapZoom();
+}
 function renderTX(e){
  const g=document.getElementById('tx');
  if(!e||!HOME||!(e.state==='calling'||e.state==='qso')||!e.grid){g.innerHTML='';mapPoints.tx=null;updateMapZoom();return;}
@@ -378,26 +691,92 @@ function renderTX(e){
  g.innerHTML=h;
  updateMapZoom();
 }
+let lastEngine=null, lastTxFlag=false, sawTxContent=false;
+
+/* ---- NEXT TX cockpit countdown: called from engTick (fresh fetch) AND from
+   a fast local timer (cached lastEngine) so the countdown ticks smoothly
+   between the 2 s polls without hitting the server any harder. ---- */
+function updateNextTx(e, tx, st){
+ const el=document.getElementById('cpNextTx');
+ el.className='cpv';
+ if(tx){
+  el.textContent='ON AIR'; el.classList.add('tx-live');
+ }else if(st==='tx_abort'){
+  el.textContent='TX ABORT'; el.classList.add('tx-abort');
+ }else if(e && e.next_tx_epoch){
+  const secs=e.next_tx_epoch-(Date.now()/1000);
+  if(secs>-5){                             // stale/unknown beyond a few seconds past
+   el.textContent=secs>0?('TX in '+secs.toFixed(1)+'s'):'KEYING…';
+   el.classList.add('tx-soon');
+  }else el.textContent='—';
+ }else el.textContent='—';
+}
+function nextTxFastTick(){ if(lastEngine) updateNextTx(lastEngine, !!lastEngine.tx, lastEngine.state||''); }
+
+/* ---- TX transparency panel: exact message + audio actually keyed.
+   tx_msg/tx_offset are set BEFORE key-up (so the countdown window already
+   previews what's about to go out) and stay put until the next attempt —
+   deliberately separate from "msg", which doubles as the abort-reason text
+   and would otherwise show stale reasons here as if they were content. Media
+   (image+audio) reloads only the first time we see any TX content, and again
+   each time a new transmission starts — never mid-playback otherwise. ---- */
+function updateTxPanel(e, tx, st){
+ const msgEl=document.getElementById('txMsg'), subEl=document.getElementById('txPanelSub'),
+       wfEl=document.getElementById('txwf'), audioEl=document.getElementById('txAudio'),
+       abortEl=document.getElementById('txAbortMsg');
+ const hasContent=!!(e && e.tx_msg);
+ if(hasContent){
+  msgEl.textContent=e.tx_msg+(e.tx_offset!=null?` @ ${e.tx_offset} Hz`:'');
+  msgEl.className=tx?'tx-live':'';
+  subEl.textContent=tx?'TRANSMITTING NOW':'last TX this session';
+  wfEl.style.display='block'; audioEl.style.display='block';
+  if(!sawTxContent || (tx && !lastTxFlag)){
+   wfEl.src='/tx_waterfall.png?t='+Date.now();
+   audioEl.src='/tx.wav?t='+Date.now();
+  }
+  sawTxContent=true;
+ }
+ lastTxFlag=tx;
+ if(st==='tx_abort' && e && e.msg){
+  abortEl.style.display='block'; abortEl.textContent='⚠ '+e.msg;
+ }else abortEl.style.display='none';
+}
+
+/* ---- cockpit STATE labels: engine.json is a snapshot that's never reset
+   when the chaser exits, so a killed/finished run can leave a stale state
+   (e.g. "hunting") on disk forever. Never trust it without first checking
+   the chaser process is actually alive (chaserRunning, from
+   refreshActionsState's /actions/state poll) — otherwise force IDLE. ---- */
+const STATE_LABELS={hunting:'AUTO-CQ',calling:'CALLING',qso:'QSO',tx_abort:'TX ABORT',
+ done:'DONE',logged:'LOGGED',breather:'BREATHER'};
 async function engTick(){
  let e=null;
  try{
   const r=await fetch('/engine.json?t='+Date.now());
   e=r.ok?await r.json():null;
  }catch(err){}
+ lastEngine=e;
  renderTX(e);
  const st=(e&&e.state)||'';
  const cp=document.getElementById('cpState');
- cp.textContent=st?st.toUpperCase():'—';
- cp.className='cpv st-'+st.toLowerCase().replace(/[^a-z]/g,'');
+ if(chaserRunning){
+  cp.textContent=STATE_LABELS[st]||(st?st.toUpperCase():'AUTO-CQ');
+  cp.className='cpv st-'+st.toLowerCase().replace(/[^a-z]/g,'');
+ }else{
+  cp.textContent='IDLE';
+  cp.className='cpv st-idle';
+ }
  const tx=!!(e&&e.tx);
  cp.classList.toggle('tx-live',tx);
  document.getElementById('btnUnkey').classList.toggle('live',tx);
+ updateNextTx(e,tx,st);
+ updateTxPanel(e,tx,st);
  /* ---- alerts (4.3): chase ended / watchdog-abort — edge-triggered off
     engine.json's state field so a steady state never re-fires ---- */
  const stl=st.toLowerCase();
  if(stl && stl!==lastEngineState){
   if(stl==='done' || stl==='ended'){
-   fireAlert('Chase ended', `chaser state: ${st}`+(e&&e.target?` (last target ${e.target})`:''));
+   fireAlert('Automatic CQ ended', `state: ${st}`+(e&&e.target?` (last target ${e.target})`:''));
   }else if(stl.includes('abort') || stl.includes('watchdog')){
    fireAlert('Watchdog/abort', `engine state: ${st}`+(e&&e.msg?` — ${e.msg}`:''));
   }
@@ -446,15 +825,12 @@ async function tick(){
   for(const x of [...(s.qsos||[])].reverse()) q+=`<tr><td>${x.call}</td><td>${x.band}</td><td>${x.grid}</td><td>${x.date}</td></tr>`;
   document.getElementById('log').innerHTML=q;
   renderRX(s);
+  renderQSOs(s);
  }catch(e){document.getElementById('stale').style.display='inline';}
  try{
   const r=await fetch('/events?t='+Date.now()); const ej=await r.json();
-  const el=document.getElementById('events');
-  const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<30;
-  el.innerHTML=(ej.lines&&ej.lines.length)
-   ? ej.lines.map(l=>`<span class="${evClass(l)}">${esc(l)}</span>`).join('\\n')
-   : 'no events yet';
-  if(atBottom) el.scrollTop=el.scrollHeight;
+  lastEventLines=ej.lines||[];
+  renderEvents();
  }catch(e){}
 }
 
@@ -472,10 +848,30 @@ function setActionsMsg(t){ document.getElementById('actionsMsg').textContent=t; 
 async function refreshActionsState(){
  try{
   const r=await fetch('/actions/state?t='+Date.now()); const j=await r.json();
-  document.getElementById('stRx').textContent=j.rxloop?'running':'stopped';
-  document.getElementById('stChaser').textContent=j.chaser?'running':'idle';
-  document.getElementById('stPtt').textContent=j.ptt?'TX':'RX';
+  const tx=!!j.ptt;
+  // this pill was showing rx-loop's process-alive state ("running") even
+  // while actively keyed, which reads as "we're receiving, not transmitting"
+  // right when the opposite is true -- flip both the label and value to a
+  // loud TX RUNNING the instant PTT is actually hot.
+  const rxLabel=document.getElementById('stRxLabel'), rxVal=document.getElementById('stRx');
+  if(tx){
+   rxLabel.textContent='TX '; rxVal.textContent='RUNNING';
+  }else{
+   rxLabel.textContent='RX '; rxVal.textContent=j.rxloop?'running':'stopped';
+  }
+  rxVal.classList.toggle('tx-live',tx);
+  const chEl=document.getElementById('stChaser');
+  chEl.textContent=j.chaser?'running':'idle';
+  chEl.classList.toggle('armed',!!j.chaser);
+  document.getElementById('stPtt').textContent=tx?'TX':'RX';
+  // ARMED (chaser alive -> a real key-up could happen any moment) vs LIVE
+  // (engine.tx===true -> keyed this instant, upgrades to the siren pulse).
+  const aw=document.getElementById('actionsWidget');
+  aw.classList.toggle('armed',!!j.chaser);
+  aw.classList.toggle('live',tx);
+  document.body.classList.toggle('tx-live',tx);
   lastRxRunning=!!j.rxloop;
+  chaserRunning=!!j.chaser;
  }catch(e){}
 }
 function wireActions(){
@@ -487,9 +883,9 @@ function wireActions(){
   refreshActionsState();
  });
  document.getElementById('btnRxStop').addEventListener('click',async()=>{
-  setActionsMsg('stopping RX…');
+  setActionsMsg('standing down: unkey + stop Automatic CQ + stop RX…');
   const r=await postAction('/action/rx/stop',{});
-  setActionsMsg(r.ok?'RX stop requested':'RX stop failed: '+(r.body.error||r.error||r.status));
+  setActionsMsg(r.ok?'stood down — RX, chaser, and PTT all stopped':'stand-down failed: '+(r.body.error||r.error||r.status));
   refreshActionsState();
  });
  document.getElementById('btnChaseStart').addEventListener('click',()=>{
@@ -502,15 +898,16 @@ function wireActions(){
   const n=parseFloat(document.getElementById('chaseN').value);
   const mode=document.getElementById('chaseMode').value;
   document.getElementById('chaseConfirmMsg').style.display='none';
-  setActionsMsg('starting chase…');
+  setActionsMsg('starting Automatic CQ…');
   const r=await postAction('/action/chase/start',{n,mode,confirm:true});
-  setActionsMsg(r.ok?'chase start requested':'chase start failed: '+(r.body.error||r.error||r.status));
+  setActionsMsg(r.ok?('Automatic CQ start requested'+(r.body.rx_autostarted?' (RX auto-started)':'')+
+   ' — watch NEXT TX up top'):('Automatic CQ start failed: '+(r.body.error||r.error||r.status)));
   refreshActionsState();
  });
  document.getElementById('btnChaseStop').addEventListener('click',async()=>{
-  setActionsMsg('stopping chase…');
+  setActionsMsg('stopping Automatic CQ…');
   const r=await postAction('/action/chase/stop',{});
-  setActionsMsg(r.ok?'chase stop requested':'chase stop failed: '+(r.body.error||r.error||r.status));
+  setActionsMsg(r.ok?'Automatic CQ stop requested':'Automatic CQ stop failed: '+(r.body.error||r.error||r.status));
   refreshActionsState();
  });
  document.getElementById('btnUnkey').addEventListener('click',async()=>{
@@ -543,7 +940,7 @@ function wireActions(){
    same /layout blob the widget system already persists (server just stores
    whatever JSON it's given, so no dashboard.py endpoint changes needed). ---- */
 let alertsEnabled=false, notifPermission=(window.Notification && Notification.permission) || 'default';
-let lastQsoCount=null, lastEngineState='', lastRxRunning=false, lastSilenceFlag=false;
+let lastQsoCount=null, lastEngineState='', lastRxRunning=false, lastSilenceFlag=false, chaserRunning=false;
 let titleFlashTimer=null; const BASE_TITLE=document.title;
 function flashTitle(text){
  if(titleFlashTimer) return;               // already flashing
@@ -559,7 +956,15 @@ function flashTitle(text){
 function doAlert(kind, text){
  console.log('[coa-alert]', kind, text);    // always logged — verifiable without a radio
  if(window.Notification && Notification.permission==='granted'){
-  try{ new Notification('COTA — '+kind, {body:text}); return; }catch(e){}
+  try{
+   const n=new Notification('COTA — '+kind, {body:text});
+   // the OS notification daemon's default action ("Activate" on many Linux
+   // desktops) fires this click event -- without a handler here it just
+   // closes the notification and does nothing else. Bring the dashboard
+   // tab into focus, which is what that action is supposed to do.
+   n.onclick=()=>{ window.focus(); n.close(); };
+   return;
+  }catch(e){}
  }
  flashTitle(text);
 }
@@ -589,7 +994,7 @@ function wireBell(){
 window.coaSimulateAlert=function(kind){
  const sims={
   qso:()=>doAlert('QSO logged', 'TEST1AA FN20 (simulated)'),
-  chase_end:()=>doAlert('Chase ended', 'chaser state: done (simulated)'),
+  chase_end:()=>doAlert('Automatic CQ ended', 'state: done (simulated)'),
   abort:()=>doAlert('Watchdog/abort', 'engine state: watchdog-test (simulated)'),
   silence:()=>doAlert('Decode silence', 'no new decodes for 3+ min (simulated)'),
  };
@@ -688,14 +1093,20 @@ updateBellUI();
 wireBell();
 loadLayout();
 wireActions();
-loadCfg().then(tick); setInterval(tick,5000);
+wireStationCfg();
+document.getElementById('evRaw').addEventListener('change',renderEvents);
+document.getElementById('txwf').addEventListener('error',function(){this.style.display='none';});
+loadCfg().then(()=>{ tick(); loadBands().then(()=>{ buildAntBandsRow(); loadAntennas(); }); });
+setInterval(tick,5000);
 engTick(); setInterval(engTick,2000);
+setInterval(nextTxFastTick,150);           // smooth NEXT TX countdown between engTick polls
 refreshActionsState(); setInterval(refreshActionsState,3000);
 </script></body></html>"""
 PAGE = (PAGE.replace("__MYCALL__", MYCALL).replace("__MYGRID__", MYGRID)
             .replace("__EVENT_LINES__", str(EVENT_LINES))
             .replace("__WORLD__", world_map.WORLD_PATH)
-            .replace("__DRYRUN__", "true" if DRYRUN else "false"))
+            .replace("__DRYRUN__", "true" if DRYRUN else "false")
+            .replace("__DEFAULT_MAX_W__", str(DEFAULT_MAX_W)))
 
 def chase_tail(n=EVENT_LINES):
     """Last n lines of chase.log without reading a huge file into memory."""
@@ -753,6 +1164,70 @@ def _pkill(pattern):
     except Exception:
         return False
 
+# ---- antenna profiles: operator-editable, band/wattage selection is locked
+# to this data + the BANDS table above (no free-form Hz entry, no wattage
+# above a per-antenna confirmed-safe max). Never touched by qso.py/rx-loop —
+# only /action/station/set below writes the *active* choice into station.conf,
+# and only when the chaser is stopped (see that handler).
+def _default_antennas():
+    """Seed from skills/antenna-atu.md (Logan's 3 physical antennas, 2026-07-03).
+    Only the EFHW has a number on record — the RFI-interim 5 W limit measured
+    that day (10 W blacks out CAT/USB serial). The two dipoles' RF-exposure-
+    verified max watts is a still-open TODO in that file; left unset (None)
+    here rather than guessed, so the UI shows them as unconfirmed until Logan
+    fills them in himself via Add/Edit."""
+    return [
+        {"id": "efhw-40m", "name": "40 m EFHW", "bands": ["40m"], "max_watts": 5,
+         "notes": "RFI-interim limit (not RF-exposure): 10 W blacks out CAT/USB serial; "
+                  "clean at 5 W. Raise only after installing a feedline common-mode choke."},
+        {"id": "dipole-40m", "name": "40 m dipole", "bands": ["40m"], "max_watts": None,
+         "notes": "TODO: confirm RF-exposure-verified max watts for this antenna's siting."},
+        {"id": "dipole-20m", "name": "20 m dipole", "bands": ["20m"], "max_watts": None,
+         "notes": "TODO: confirm RF-exposure-verified max watts for this antenna's siting."},
+    ]
+
+def _slugify(name):
+    s = "".join(c.lower() if c.isalnum() else "-" for c in name.strip())
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s.strip("-") or "antenna"
+
+def _load_antennas():
+    try:
+        with open(ANTENNAS_JSON) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except (OSError, ValueError):
+        pass
+    seed = _default_antennas()
+    atomic_write_json(ANTENNAS_JSON, seed)
+    return seed
+
+def _save_antennas(lst):
+    atomic_write_json(ANTENNAS_JSON, lst)
+
+def _find_antenna(lst, aid):
+    for a in lst:
+        if a["id"] == aid:
+            return a
+    return None
+
+def _validate_bands(bands):
+    return isinstance(bands, list) and bool(bands) and all(b in BANDS for b in bands)
+
+def _validate_max_watts(mw):
+    """Returns (ok, value_or_errmsg). None is always valid (unconfirmed)."""
+    if mw is None:
+        return True, None
+    try:
+        mw = float(mw)
+    except (TypeError, ValueError):
+        return False, "max_watts must be numeric or null"
+    if not (0 < mw <= ABS_MAX_W):
+        return False, f"max_watts out of range (0-{ABS_MAX_W})"
+    return True, mw
+
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=DATA, **kw)
@@ -779,6 +1254,11 @@ class H(http.server.SimpleHTTPRequestHandler):
             self.send_body(body, "application/json")
         elif path == "/config":
             self.send_body(json.dumps(CONFIG).encode(), "application/json")
+        elif path == "/antennas":
+            self.send_body(json.dumps(_load_antennas()).encode(), "application/json")
+        elif path == "/bands":
+            body = json.dumps([{"name": n, **v} for n, v in BANDS.items()]).encode()
+            self.send_body(body, "application/json")
         elif path == "/layout":
             try:
                 with open(LAYOUT_JSON, "rb") as f:
@@ -838,6 +1318,14 @@ class H(http.server.SimpleHTTPRequestHandler):
                 self._action_target_write(body, TARGET_REQ, "pick", need_call=True)
             elif path == "/action/target/skip":
                 self._action_target_write(body, SKIP_REQ, "skip", need_call=False)
+            elif path == "/action/antenna/add":
+                self._action_antenna_add(body)
+            elif path == "/action/antenna/update":
+                self._action_antenna_update(body)
+            elif path == "/action/antenna/remove":
+                self._action_antenna_remove(body)
+            elif path == "/action/station/set":
+                self._action_station_set(body)
             else:
                 self._err(404, "no such endpoint")
         except Exception as e:
@@ -857,12 +1345,24 @@ class H(http.server.SimpleHTTPRequestHandler):
         self._ok({"started": True})
 
     def _action_rx_stop(self):
+        """Full stand-down, not just "stop decoding": without RX there's
+        nothing for a live chaser to answer, so leaving it running would just
+        spin uselessly forever — pull it down too. Order matches _action_unkey:
+        rigctl T 0 first and unconditionally (independent of chaser health),
+        then kill the chaser, then stop rx-loop last."""
         if DRYRUN:
-            log_action(f"[DRYRUN] would stop rx-loop: pkill -f {RXLOOP_SH}")
+            log_action(f"[DRYRUN] would stand down: rigctl T 0; pkill -f {QSO_PY}; pkill -f {RXLOOP_SH}")
             return self._ok({"stopped": True, "dryrun": True})
+        try:
+            subprocess.run(["rigctl", "-m", RIG_MODEL, "-r", CAT_PORT, "-s", CAT_BAUD, "T", "0"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            log_action(f"rx/stop: rigctl T 0 error: {e!r}")
+        killed_chaser = _pkill(QSO_PY)
         ok = _pkill(RXLOOP_SH)
-        log_action(f"rx/stop: pkill -f {RXLOOP_SH} -> {ok}")
-        self._ok({"stopped": ok})
+        log_action(f"rx/stop: rigctl T 0 (sent first); pkill -f {QSO_PY} -> {killed_chaser}; "
+                   f"pkill -f {RXLOOP_SH} -> {ok}")
+        self._ok({"stopped": ok, "chaser_killed": killed_chaser})
 
     def _action_chase_start(self, body):
         if not body.get("confirm"):
@@ -891,12 +1391,14 @@ class H(http.server.SimpleHTTPRequestHandler):
         if _proc_running(QSO_PY):
             log_action("chase/start: refused, chaser already running")
             return self._err(409, "chaser already running")
+        rx_autostarted = False
         if not _proc_running(RXLOOP_SH):
-            log_action("chase/start: refused, rx-loop not running")
-            return self._err(409, "start RX first")
+            _spawn_detached(["bash", RXLOOP_SH], os.path.join(DATA, "rx-loop.log"))
+            log_action(f"chase/start: rx-loop wasn't running, auto-started bash {RXLOOP_SH}")
+            rx_autostarted = True
         _spawn_detached(args, CHASELOG)
         log_action(f"chase/start: spawned {' '.join(args)} ({desc})")
-        self._ok({"started": True})
+        self._ok({"started": True, "rx_autostarted": rx_autostarted})
 
     def _action_chase_stop(self):
         if DRYRUN:
@@ -907,23 +1409,30 @@ class H(http.server.SimpleHTTPRequestHandler):
         self._ok({"stopped": ok})
 
     def _action_unkey(self):
-        """STOP + UNKEY: zero confirmation, one click. Kills the chaser then
-        sends rigctl T 0 (release PTT) and reads PTT back. Never sends T 1."""
+        """STOP + UNKEY: zero confirmation, one click, works regardless of
+        chaser/app health. Order matters: rigctl T 0 fires FIRST and
+        unconditionally — this is a direct, independent call to the rig, not
+        routed through qso.py's own state machine, so it still works even if
+        the chaser is hung/buggy. Killing the chaser and reading PTT back are
+        secondary cleanup and never gate or delay the T 0 call. Never sends T 1."""
         if DRYRUN:
-            log_action(f"[DRYRUN] would UNKEY: pkill -f {QSO_PY}; "
-                       f"rigctl -m {RIG_MODEL} -r {CAT_PORT} -s {CAT_BAUD} T 0")
+            log_action(f"[DRYRUN] would UNKEY: rigctl -m {RIG_MODEL} -r {CAT_PORT} -s {CAT_BAUD} T 0; "
+                       f"pkill -f {QSO_PY}")
             return self._ok({"unkeyed": True, "dryrun": True, "ptt": None})
-        killed = _pkill(QSO_PY)
-        ptt = None
         try:
             subprocess.run(["rigctl", "-m", RIG_MODEL, "-r", CAT_PORT, "-s", CAT_BAUD, "T", "0"],
                            capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            log_action(f"UNKEY: rigctl T 0 error: {e!r}")
+        killed = _pkill(QSO_PY)
+        ptt = None
+        try:
             r2 = subprocess.run(["rigctl", "-m", RIG_MODEL, "-r", CAT_PORT, "-s", CAT_BAUD, "t"],
                                capture_output=True, text=True, timeout=10)
             ptt = r2.stdout.strip()
         except Exception as e:
-            log_action(f"UNKEY: rigctl error: {e!r}")
-        log_action(f"UNKEY: pkill -f {QSO_PY} (killed={killed}); rigctl T 0; PTT readback={ptt}")
+            log_action(f"UNKEY: PTT readback error: {e!r}")
+        log_action(f"UNKEY: rigctl T 0 (sent first); pkill -f {QSO_PY} (killed={killed}); PTT readback={ptt}")
         self._ok({"unkeyed": True, "killed": killed, "ptt": ptt})
 
     def _action_target_write(self, body, path, kind, need_call):
@@ -936,6 +1445,123 @@ class H(http.server.SimpleHTTPRequestHandler):
         atomic_write_json(path, obj)
         log_action(f"target/{kind}: {obj}")
         self._ok({"written": os.path.basename(path)})
+
+    def _action_antenna_add(self, body):
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return self._err(400, "name required")
+        bands = body.get("bands")
+        if not _validate_bands(bands):
+            return self._err(400, "bands must be a non-empty list of valid band names")
+        mw_ok, mw = _validate_max_watts(body.get("max_watts"))
+        if not mw_ok:
+            return self._err(400, mw)
+        notes = str(body.get("notes", "")).strip()
+        lst = _load_antennas()
+        base = _slugify(name)
+        aid, i, existing = base, 2, {a["id"] for a in lst}
+        while aid in existing:
+            aid = f"{base}-{i}"; i += 1
+        entry = {"id": aid, "name": name, "bands": bands, "max_watts": mw, "notes": notes}
+        lst.append(entry)
+        _save_antennas(lst)
+        log_action(f"antenna/add: {entry}")
+        self._ok({"antenna": entry, "antennas": lst})
+
+    def _action_antenna_update(self, body):
+        aid = str(body.get("id", "")).strip()
+        lst = _load_antennas()
+        entry = _find_antenna(lst, aid)
+        if not entry:
+            return self._err(404, "no such antenna")
+        if "name" in body:
+            name = str(body["name"]).strip()
+            if not name:
+                return self._err(400, "name cannot be empty")
+            entry["name"] = name
+        if "bands" in body:
+            if not _validate_bands(body["bands"]):
+                return self._err(400, "bands must be a non-empty list of valid band names")
+            entry["bands"] = body["bands"]
+        if "max_watts" in body:
+            mw_ok, mw = _validate_max_watts(body["max_watts"])
+            if not mw_ok:
+                return self._err(400, mw)
+            entry["max_watts"] = mw
+        if "notes" in body:
+            entry["notes"] = str(body["notes"]).strip()
+        _save_antennas(lst)
+        log_action(f"antenna/update: {entry}")
+        self._ok({"antenna": entry, "antennas": lst})
+
+    def _action_antenna_remove(self, body):
+        aid = str(body.get("id", "")).strip()
+        lst = _load_antennas()
+        entry = _find_antenna(lst, aid)
+        if not entry:
+            return self._err(404, "no such antenna")
+        lst = [a for a in lst if a["id"] != aid]
+        _save_antennas(lst)
+        was_active = (_C.get("ANTENNA", "") == aid)
+        log_action(f"antenna/remove: {aid} (was_active={was_active})")
+        self._ok({"removed": aid, "antennas": lst, "was_active": was_active})
+
+    def _action_station_set(self, body):
+        """Config-only: writes ANTENNA/BAND/DIAL_HZ/TX_PWR to station.conf.
+        Never touches the CAT port — qso.py/rx-loop only ever READ these keys
+        (at their own process start) and verify the operator has manually
+        retuned the radio to match before every key-up; this endpoint can't
+        retune the rig itself, by design (see BANDS' comment above)."""
+        if _proc_running(QSO_PY):
+            return self._err(409, "stop the chaser before changing station config")
+        aid = str(body.get("antenna_id", "")).strip()
+        band = str(body.get("band", "")).strip()
+        lst = _load_antennas()
+        entry = _find_antenna(lst, aid)
+        if not entry:
+            return self._err(400, "no such antenna")
+        if band not in BANDS:
+            return self._err(400, "unknown band")
+        if band not in entry["bands"]:
+            return self._err(400, f"{entry['name']} is not built for {band}")
+        try:
+            tx_pwr = float(body.get("tx_pwr"))
+        except (TypeError, ValueError):
+            return self._err(400, "tx_pwr must be numeric")
+        if tx_pwr <= 0:
+            return self._err(400, "tx_pwr must be positive")
+        cap = entry.get("max_watts") or DEFAULT_MAX_W
+        band_cap = BANDS[band]["cap_w"]
+        if band_cap:
+            cap = min(cap, band_cap)
+        cap = min(cap, ABS_MAX_W)
+        if tx_pwr > cap:
+            return self._err(400, f"{tx_pwr:g} W exceeds the safe cap for this antenna/band ({cap:g} W)")
+        freq_hz = BANDS[band]["freq_hz"]
+        tx_pwr_out = int(tx_pwr) if tx_pwr == int(tx_pwr) else tx_pwr
+        station_config.save_keys({"ANTENNA": aid, "BAND": band, "DIAL_HZ": freq_hz, "TX_PWR": tx_pwr_out})
+        # dashboard's own CONFIG is live in-memory (no restart needed — /config
+        # reflects this immediately). rx-loop.sh dot-sources station.conf ONCE
+        # at its own process start and never re-reads it, so its BAND value
+        # (waterfall image title only — it doesn't gate anything safety-related)
+        # goes stale until that process is replaced; auto-restart it here so
+        # the operator never has to remember a manual step. qso.py needs no
+        # restart either: chase/start always spawns a brand-new process, which
+        # reads station.conf fresh at that moment.
+        CONFIG.update(antenna=aid, band=band, dial_hz=freq_hz, tx_pwr=str(tx_pwr_out))
+        rx_restarted = False
+        if _proc_running(RXLOOP_SH) and not DRYRUN:
+            _pkill(RXLOOP_SH)
+            _spawn_detached(["bash", RXLOOP_SH], os.path.join(DATA, "rx-loop.log"))
+            rx_restarted = True
+        log_action(f"station/set: antenna={aid} band={band} dial_hz={freq_hz} tx_pwr={tx_pwr_out} "
+                   f"rx_restarted={rx_restarted}")
+        self._ok({
+            "antenna": aid, "band": band, "dial_hz": freq_hz, "tx_pwr": tx_pwr_out,
+            "rx_restarted": rx_restarted,
+            "note": f"Saved and applied. Retune the radio to {freq_hz/1e6:.3f} MHz before chasing — "
+                    f"config takes effect immediately; nothing else to restart."
+        })
 
     def log_message(self, *a):
         pass

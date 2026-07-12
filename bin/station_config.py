@@ -26,3 +26,39 @@ def load(path=None):
     except OSError:
         pass
     return cfg
+
+
+def save_keys(updates, path=None):
+    """Rewrite station.conf in place, replacing each existing KEY=... line's
+    value with str(updates[KEY]) while preserving everything else about that
+    line (inline comment, spacing before '#'). Keys with no existing line are
+    appended. Stays valid shell (bin/coa dot-sources this same file), so
+    values must not contain '#' or a newline — callers pass plain numbers/
+    short tokens (band names, Hz, watts), never free text."""
+    p = path or CONF_PATH
+    try:
+        with open(p) as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        key = None
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+        if key is not None and key in remaining:
+            value = str(remaining.pop(key))
+            rest = line.split("=", 1)[1]
+            comment = ""
+            if "#" in rest:
+                comment = " #" + rest.split("#", 1)[1].rstrip("\n")
+            nl = "\n" if line.endswith("\n") else ""
+            out.append(f"{key}={value}{comment}{nl}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}\n")
+    with open(p, "w") as f:
+        f.writelines(out)

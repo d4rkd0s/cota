@@ -127,6 +127,102 @@ class TestBusyDetection(unittest.TestCase):
         self.assertFalse(qso.target_busy("W9XYZ N4QQQ -05", "K1ABC"))
 
 
+class TestTxBoundary(unittest.TestCase):
+    """compute_tx_boundary(t, our_parity) — pure extraction of transmit()'s
+    slot-scheduling math (dashboard "time to next TX" instrumentation).
+    Must stay behaviorally identical to the inline version it replaced."""
+
+    def test_join_current_slot_within_late_window(self):
+        # our_parity=0 slot starts at 30 (30%30=0 -> parity 0); 1.0 s in,
+        # inside the <1.8 s late-join window -> join immediately
+        self.assertEqual(qso.compute_tx_boundary(31.0, 0), 30)
+
+    def test_at_the_window_edge_does_not_join(self):
+        # exactly 1.8 s in: condition is strict "< 1.8", so this must NOT
+        # join the current slot — falls through to the next same-parity one
+        self.assertEqual(qso.compute_tx_boundary(31.8, 0), 60)
+
+    def test_just_inside_the_window_joins(self):
+        self.assertEqual(qso.compute_tx_boundary(31.79, 0), 30)
+
+    def test_late_in_slot_skips_to_next_same_parity(self):
+        # 2 s into a parity-0 slot (30) -> too late, next parity-0 slot is 30 s later
+        self.assertEqual(qso.compute_tx_boundary(32.0, 0), 60)
+
+    def test_wrong_parity_advances_to_next_matching_slot(self):
+        # t=47 falls in the slot starting at 45 (45%30=15 -> parity 1);
+        # our_parity=0 -> next parity-0 slot is 60
+        self.assertEqual(qso.compute_tx_boundary(47.0, 0), 60)
+
+    def test_odd_parity_symmetry(self):
+        # mirror of test_join_current_slot_within_late_window for parity 1
+        # (slot 45 has parity 1)
+        self.assertEqual(qso.compute_tx_boundary(46.0, 1), 45)
+
+    def test_boundary_always_matches_requested_parity(self):
+        # property check across a spread of times/parities: the result must
+        # always (a) be a 15 s slot boundary, (b) carry the requested parity,
+        # (c) be >= the current slot start (never scheduled in the past)
+        for t in [0, 1, 14, 14.9, 15, 16, 29, 30, 30.5, 44, 44.9, 100.3, 12345.6]:
+            for p in (0, 1):
+                b = qso.compute_tx_boundary(t, p)
+                self.assertEqual(b % 15, 0, f"t={t} p={p} -> {b} not a slot boundary")
+                self.assertEqual(qso.parity(b), p, f"t={t} p={p} -> {b} has wrong parity")
+                self.assertGreaterEqual(b, qso.slot_start(t))
+
+
+class TestTargetSelection(unittest.TestCase):
+    """select_target(cqs, requested_call) — honors a dashboard "request this
+    call" click over the automatic SNR/pileup ranking, WITHOUT bypassing the
+    SNR-floor/directed-CQ etiquette filters (those already ran before a
+    candidate ever reaches `cqs`, so select_target only ever chooses among
+    already-answerable candidates — this is what makes honoring a manual
+    pick safe). skip_is_requested(ts, since) gates a skip-request's
+    timestamp against when the current target pursuit began, so a stale
+    skip from a previous target can't instantly abort a brand new one."""
+
+    def cq(self, call, grid="FN20"):
+        return ({"msg": f"CQ {call} {grid}", "snr": -10}, call, grid)
+
+    def test_no_request_falls_back_to_first(self):
+        cqs = [self.cq("K1ABC"), self.cq("W4VBK")]
+        self.assertEqual(qso.select_target(cqs, None)[1], "K1ABC")
+
+    def test_empty_string_request_falls_back_to_first(self):
+        cqs = [self.cq("K1ABC"), self.cq("W4VBK")]
+        self.assertEqual(qso.select_target(cqs, "")[1], "K1ABC")
+
+    def test_request_matching_a_non_first_candidate_wins(self):
+        cqs = [self.cq("K1ABC"), self.cq("W4VBK"), self.cq("N0XYZ")]
+        self.assertEqual(qso.select_target(cqs, "W4VBK")[1], "W4VBK")
+
+    def test_request_not_present_falls_back_to_first(self):
+        # requested call isn't (or is no longer) among this cycle's
+        # answerable CQs — never invent a target out of thin air
+        cqs = [self.cq("K1ABC"), self.cq("W4VBK")]
+        self.assertEqual(qso.select_target(cqs, "ZZ9ZZZ")[1], "K1ABC")
+
+    def test_request_matching_first_is_a_noop(self):
+        cqs = [self.cq("K1ABC"), self.cq("W4VBK")]
+        self.assertEqual(qso.select_target(cqs, "K1ABC")[1], "K1ABC")
+
+
+class TestSkipRequest(unittest.TestCase):
+    def test_no_request_never_skips(self):
+        self.assertFalse(qso.skip_is_requested(None, 1000.0))
+
+    def test_stale_request_before_target_start_ignored(self):
+        # skip was clicked for a PREVIOUS target — must not instantly
+        # abort a brand new one that started after the click
+        self.assertFalse(qso.skip_is_requested(999.0, 1000.0))
+
+    def test_request_at_exact_start_honored(self):
+        self.assertTrue(qso.skip_is_requested(1000.0, 1000.0))
+
+    def test_request_after_start_honored(self):
+        self.assertTrue(qso.skip_is_requested(1005.0, 1000.0))
+
+
 class TestStalledCQDetection(unittest.TestCase):
     def test_target_cq_detected(self):
         self.assertTrue(qso.is_target_cq("CQ K1ABC FN42", "K1ABC"))

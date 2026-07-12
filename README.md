@@ -90,7 +90,7 @@ rig ──USB audio──> PulseAudio ──parecord 12 kHz──> data/slot.wav
                     jt9 -8 (WSJT-X CLI decoder — best sensitivity)
                     sox spectrogram → data/waterfall.png
                                      │
-                    bin/rx-loop.sh → data/decodes.jsonl + data/status.json
+                    bin/rx-loop.sh → data/decodes/YYYY-MM-DD/HH.jsonl + data/status.json
                                      │
                     bin/dashboard.py (http://localhost:8074) ← your browser
                                      │
