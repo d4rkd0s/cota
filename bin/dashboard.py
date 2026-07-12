@@ -98,10 +98,18 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
  #cockpit .cpitem{display:flex;flex-direction:column;gap:2px}
  #cockpit .cpk{font-size:10px;letter-spacing:.12em;color:#8b949e}
  #cockpit .cpv{font-size:28px;font-weight:800;font-family:ui-monospace,monospace;line-height:1.1}
+ /* ---- red means ONE thing everywhere in this UI: literally keyed, on air,
+    right now (tx===true). Anything short of that (calling, mid-QSO, armed)
+    is orange -- "active" but not hot. Whole-page background follows the
+    same rule (body.tx-live only), no separate "pursuing" tint. ---- */
  #cpState.st-tx,#cpState.tx-live{color:#f85149;animation:pulse 1s ease-in-out infinite}
  #cpState.st-calling{color:#f0883e} #cpState.st-qso{color:#3fb950}
  #cpState.st-hunting{color:#56d4dd}
  #cpState.st-breather,#cpState.st-idle,#cpState.st-init,#cpState.st-{color:#8b949e}
+ #cpCalling{font-size:16px;color:#f0883e}
+ #cpCalling.tx-live{color:#f85149;animation:pulse .6s ease-in-out infinite}
+ #cpQsoStep{font-size:16px;color:#8b949e}
+ #cpQsoStep.active{color:#f0883e}
  #cpNext{color:#3fb950}
  /* ---- NEXT TX cockpit countdown: idle / counting-down / on-air / aborted ---- */
  #cpNextTx{color:#8b949e}
@@ -116,6 +124,11 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
   border-radius:6px;font-size:17px;font-weight:800;padding:14px 22px;cursor:pointer;
   letter-spacing:.03em;transition:background .15s,color .15s}
  #btnUnkey:hover{background:#2d1214} #btnUnkey:active{background:#3d1a16}
+ #btnTune30{position:relative;background:#21262d;color:#58a6ff;border:2px solid #1f6feb;
+  border-radius:6px;font-size:15px;font-weight:800;padding:14px 18px;cursor:pointer;
+  letter-spacing:.03em;transition:background .15s,color .15s}
+ #btnTune30:hover{background:#0d2650} #btnTune30:active{background:#123166}
+ #btnTune30:disabled{opacity:.6;cursor:default}
  #btnUnkey.live{background:#f85149;color:#fff;border-color:#f85149;
   animation:sirenGlow 1s ease-in-out infinite}
  #btnUnkey.live::before,#btnUnkey.live::after{content:'';position:absolute;inset:-3px;
@@ -202,13 +215,16 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
 <h1>\U0001F4FB FT8-Claude <small>— __MYCALL__ · __MYGRID__ · RX monitor</small> <span id=stale>⚠ STALE — rx-loop not updating</span></h1>
 <div id=cockpit>
  <div class=cpitem><span class=cpk>STATE</span><span class="cpv st-" id=cpState>—</span></div>
+ <div class=cpitem><span class=cpk>CALLING</span><span class=cpv id=cpCalling title="where the current target is (DXCC-style prefix lookup, best-effort)">—</span></div>
+ <div class=cpitem><span class=cpk>QSO STEP</span><span class=cpv id=cpQsoStep title="progress through the current exchange: call -&gt; report -&gt; RR73/73 -&gt; done">—</span></div>
  <div class=cpitem><span class=cpk>BAND</span><span class=cpv id=cpBand>—</span></div>
  <div class=cpitem><span class=cpk>NEXT CALL</span><span class="cpv" id=cpNext>—</span></div>
  <div class=cpitem><span class=cpk>NEXT TX</span><span class=cpv id=cpNextTx title="countdown to the next scheduled key-up, or ON AIR while transmitting">—</span></div>
  <div class=spacer></div>
  <button id=btnBell class=actionbtn title="desktop alerts: new QSO, Automatic CQ ended, watchdog/abort, decode silence &gt;3 min">Alerts: OFF</button>
  <button id=resetLayout class=actionbtn title="restore default widget layout">Reset layout</button>
- <button id=btnUnkey title="stop Automatic CQ + rigctl T 0 — no confirmation">STOP + UNKEY</button>
+ <button id=btnTune30 title="stop Automatic CQ + rigctl T 0, then a 30s window to run a manual TUNE cycle — does not auto-resume, click Automatic CQ again when done">TUNE</button>
+ <button id=btnUnkey title="stop Automatic CQ + rigctl T 0 — no confirmation">STOP</button>
 </div>
 <div id=dash>
 
@@ -274,7 +290,7 @@ PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>FT8-Claude —
     <div class=arow><button id=btnChaseConfirm class="actionbtn warn tx-capable">Confirm start Automatic CQ</button>
      <button id=btnChaseCancel class=actionbtn>Cancel</button></div></div>
    <div class=dim id=actionsMsg></div>
-   <div class=dim style="margin-top:6px">STOP + UNKEY is always available, top right — no confirmation, one click.</div>
+   <div class=dim style="margin-top:6px">STOP is always available, top right — no confirmation, one click.</div>
   </div>
  </div>
 
@@ -427,6 +443,153 @@ function grid2ll(g){                       // Maidenhead 4/6-char -> [lat,lon] (
 }
 function ll2xy(ll){ return [(ll[1]+180)/360*MW, (90-ll[0])/180*MH]; }
 function isGrid(t){ return /^[A-R]{2}[0-9]{2}$/.test(t) && t!=='RR73'; }
+/* ---- callsign prefix -> country, display only (best-effort DXCC-style
+   lookup, not exhaustive). Longest matching prefix wins regardless of list
+   order, so a 2-char entry like A7/Qatar always beats a broader single-
+   letter US range -- no need to hand-sort this list for collisions. ---- */
+const CALL_PREFIXES=[
+ ['A7','Qatar'],['A4','Oman'],['A6','United Arab Emirates'],['A9','Bahrain'],['AP','Pakistan'],
+ ['KL','Alaska'],['KH','Hawaii / Pacific'],['KP','Caribbean (US)'],
+ ['VE','Canada'],['VA','Canada'],['VO','Canada'],['VY','Canada'],
+ ['XE','Mexico'],
+ ['EI','Ireland'],['EJ','Ireland'],
+ ['DL','Germany'],
+ ['PA','Netherlands'],['PB','Netherlands'],['PC','Netherlands'],['PD','Netherlands'],
+ ['PE','Netherlands'],['PF','Netherlands'],['PG','Netherlands'],['PH','Netherlands'],['PI','Netherlands'],
+ ['IK','Italy'],['IZ','Italy'],['IW','Italy'],['IU','Italy'],['IN','Italy'],['IB','Italy'],['IC','Italy'],['IT','Italy'],
+ ['EA','Spain'],['EB','Spain'],['EC','Spain'],
+ ['CT','Portugal'],
+ ['SM','Sweden'],['SA','Sweden'],['SB','Sweden'],['SC','Sweden'],['SD','Sweden'],['SE','Sweden'],
+ ['SF','Sweden'],['SG','Sweden'],['SH','Sweden'],['SI','Sweden'],['SJ','Sweden'],['SK','Sweden'],['SL','Sweden'],
+ ['LA','Norway'],['LB','Norway'],['LJ','Norway'],['LN','Norway'],
+ ['OH','Finland'],
+ ['OZ','Denmark'],['OU','Denmark'],['OV','Denmark'],['OW','Denmark'],['OX','Greenland'],
+ ['SP','Poland'],['SN','Poland'],['SO','Poland'],['SQ','Poland'],['SR','Poland'],['HF','Poland'],
+ ['ON','Belgium'],['OO','Belgium'],['OP','Belgium'],['OQ','Belgium'],['OR','Belgium'],['OS','Belgium'],['OT','Belgium'],
+ ['HB','Switzerland'],
+ ['OE','Austria'],
+ ['SV','Greece'],
+ ['UA','Russia'],['UB','Russia'],['UC','Russia'],
+ ['JA','Japan'],['JE','Japan'],['JF','Japan'],['JG','Japan'],['JH','Japan'],['JI','Japan'],
+ ['JJ','Japan'],['JK','Japan'],['JL','Japan'],['JM','Japan'],['JN','Japan'],['JO','Japan'],
+ ['JP','Japan'],['JQ','Japan'],['JR','Japan'],['JS','Japan'],
+ ['VK','Australia'],
+ ['ZL','New Zealand'],
+ ['PY','Brazil'],['PP','Brazil'],['PQ','Brazil'],['PR','Brazil'],['PS','Brazil'],['PT','Brazil'],
+ ['PU','Brazil'],['PV','Brazil'],['PW','Brazil'],['ZV','Brazil'],['ZW','Brazil'],['ZX','Brazil'],['ZY','Brazil'],['ZZ','Brazil'],
+ ['LU','Argentina'],['LW','Argentina'],
+ ['ZS','South Africa'],['ZR','South Africa'],['ZT','South Africa'],['ZU','South Africa'],
+ ['VU','India'],
+ ['BY','China'],['BA','China'],['BD','China'],['BG','China'],['BH','China'],['BI','China'],['BJ','China'],['BL','China'],
+ ['AA','United States'],['AB','United States'],['AC','United States'],['AD','United States'],['AE','United States'],
+ ['AF','United States'],['AG','United States'],['AI','United States'],['AJ','United States'],
+ ['AK','United States'],['AL','United States'],
+ ['K','United States'],['N','United States'],['W','United States'],
+ ['2E','United Kingdom'],['G','United Kingdom'],['M','United Kingdom'],
+ ['F','France'],['I','Italy'],['R','Russia'],
+];
+function callCountry(call){
+ if(!call) return '';
+ const base=call.split('/')[0].toUpperCase();
+ let best=null;
+ for(const [pfx,country] of CALL_PREFIXES){
+  if(base.startsWith(pfx) && (!best || pfx.length>best[0].length)) best=[pfx,country];
+ }
+ return best?best[1]:'';
+}
+/* ---- US state from grid square lat/lon: approximate rectangular bounding
+   boxes, not real state borders -- good enough for a casual cockpit display,
+   will be wrong near some state lines. [minLat,maxLat,minLon,maxLon]. ---- */
+const US_STATE_BOXES=[
+ ['Alabama',30.2,35.0,-88.5,-84.9],['Arizona',31.3,37.0,-114.8,-109.0],
+ ['Arkansas',33.0,36.5,-94.6,-89.6],['California',32.5,42.0,-124.4,-114.1],
+ ['Colorado',37.0,41.0,-109.1,-102.0],['Connecticut',41.0,42.1,-73.7,-71.8],
+ ['Delaware',38.4,39.8,-75.8,-75.0],['Florida',24.5,31.0,-87.6,-80.0],
+ ['Georgia',30.4,35.0,-85.6,-80.8],['Idaho',42.0,49.0,-117.2,-111.0],
+ ['Illinois',37.0,42.5,-91.5,-87.0],['Indiana',37.8,41.8,-88.1,-84.8],
+ ['Iowa',40.4,43.5,-96.6,-90.1],['Kansas',37.0,40.0,-102.1,-94.6],
+ ['Kentucky',36.5,39.1,-89.6,-82.0],['Louisiana',29.0,33.0,-94.0,-89.0],
+ ['Maine',43.0,47.5,-71.1,-66.9],['Maryland',37.9,39.7,-79.5,-75.0],
+ ['Massachusetts',41.2,42.9,-73.5,-69.9],['Michigan',41.7,48.3,-90.4,-82.4],
+ ['Minnesota',43.5,49.4,-97.2,-89.5],['Mississippi',30.2,35.0,-91.7,-88.1],
+ ['Missouri',36.0,40.6,-95.8,-89.1],['Montana',44.4,49.0,-116.1,-104.0],
+ ['Nebraska',40.0,43.0,-104.1,-95.3],['Nevada',35.0,42.0,-120.0,-114.0],
+ ['New Hampshire',42.7,45.3,-72.6,-70.6],['New Jersey',38.9,41.4,-75.6,-73.9],
+ ['New Mexico',31.3,37.0,-109.1,-103.0],['New York',40.5,45.0,-79.8,-71.9],
+ ['North Carolina',33.8,36.6,-84.3,-75.5],['North Dakota',45.9,49.0,-104.1,-96.6],
+ ['Ohio',38.4,42.0,-84.8,-80.5],['Oklahoma',33.6,37.0,-103.0,-94.4],
+ ['Oregon',42.0,46.3,-124.6,-116.5],['Pennsylvania',39.7,42.3,-80.5,-74.7],
+ ['Rhode Island',41.1,42.0,-71.9,-71.1],['South Carolina',32.0,35.2,-83.4,-78.5],
+ ['South Dakota',42.5,45.9,-104.1,-96.4],['Tennessee',35.0,36.7,-90.3,-81.6],
+ ['Texas',25.8,36.5,-106.7,-93.5],['Utah',37.0,42.0,-114.1,-109.0],
+ ['Vermont',42.7,45.0,-73.5,-71.5],['Virginia',36.5,39.5,-83.7,-75.2],
+ ['Washington',45.5,49.0,-124.8,-116.9],['West Virginia',37.2,40.6,-82.7,-77.7],
+ ['Wisconsin',42.4,47.1,-92.9,-86.8],['Wyoming',41.0,45.0,-111.1,-104.0],
+ ['District of Columbia',38.8,39.0,-77.1,-76.9],
+];
+function usStateFromGrid(grid){
+ const ll=grid2ll(grid); if(!ll) return '';
+ const [lat,lon]=ll;
+ for(const [name,minLat,maxLat,minLon,maxLon] of US_STATE_BOXES){
+  if(lat>=minLat && lat<=maxLat && lon>=minLon && lon<=maxLon) return name;
+ }
+ return '';
+}
+/* ---- fallback when a CQ carries no grid at all (some special-event/
+   compound calls omit one): the "call area" digit right after a US call's
+   prefix letters (the "5" in W5C) gives a rough historical region -- not
+   reliable post-vanity-callsigns, but far better than nothing, and gives
+   the map a point to plot instead of skipping the target entirely. Always
+   labeled "(approx.)" so it's never confused with a real grid-derived fix. ---- */
+const US_CALL_AREAS={
+ '0':{label:'North Central US',ll:[40.0,-98.0]},
+ '1':{label:'New England, US',ll:[42.5,-71.5]},
+ '2':{label:'New York / New Jersey, US',ll:[41.0,-74.5]},
+ '3':{label:'Mid-Atlantic, US',ll:[39.5,-77.0]},
+ '4':{label:'Southeast US',ll:[33.5,-84.0]},
+ '5':{label:'South Central US',ll:[32.5,-97.0]},
+ '6':{label:'California, US',ll:[37.0,-119.5]},
+ '7':{label:'Pacific NW / Mountain, US',ll:[44.0,-116.0]},
+ '8':{label:'Ohio Valley, US',ll:[40.0,-82.5]},
+ '9':{label:'Great Lakes, US',ll:[42.0,-89.0]},
+};
+function usCallAreaInfo(call){
+ if(!call) return null;
+ const base=call.split('/')[0].toUpperCase();
+ const m=base.match(/^[A-Z]{1,2}([0-9])/);
+ return m?(US_CALL_AREAS[m[1]]||null):null;
+}
+/* ---- full "where are we calling" label: US contacts show the actual state
+   (from their grid, since a callsign prefix alone can't tell you that),
+   falling back to the approximate call-area region when there's no grid;
+   everything else shows the country from callCountry(). ---- */
+function callLocation(call, grid){
+ const country=callCountry(call);
+ if(country==='United States'){
+  if(grid){
+   const state=usStateFromGrid(grid);
+   if(state) return `${state}, USA (${grid})`;
+  }
+  const area=usCallAreaInfo(call);
+  if(area) return `${area.label} (approx.)`;
+  return grid?`United States (${grid})`:'United States';
+ }
+ if(country==='Alaska') return grid?`Alaska, USA (${grid})`:'Alaska, USA';
+ if(country==='Hawaii / Pacific') return grid?`Hawaii, USA (${grid})`:'Hawaii, USA';
+ if(country) return grid?`${country} (${grid})`:country;
+ return grid||call||'';
+}
+/* ---- lat/lon for the map: prefer the real grid, fall back to the
+   call-area's approximate center so a gridless target still gets plotted
+   instead of vanishing from the map entirely. ---- */
+function targetLatLon(call, grid){
+ const ll=grid2ll(grid); if(ll) return ll;
+ if(callCountry(call)==='United States'){
+  const area=usCallAreaInfo(call);
+  if(area) return area.ll;
+ }
+ return null;
+}
 function decodeTime(date,slot){            // "260704","014045" -> ms UTC
  let t=Date.UTC(2000+ +date.slice(0,2), +date.slice(2,4)-1, +date.slice(4,6),
                 +slot.slice(0,2), +slot.slice(2,4), +slot.slice(4,6));
@@ -467,12 +630,14 @@ function animateViewBoxTo(target){
  }
  vbAnimId=requestAnimationFrame(step);
 }
-function computeBBox(){
- const pts=[];
- if(HOME) pts.push(HOME);
- for(const p of mapPoints.rx) pts.push(p);
- for(const p of mapPoints.qso) pts.push(p);
- if(mapPoints.tx) pts.push(mapPoints.tx);
+function computeBBox(pts){
+ if(!pts){
+  pts=[];
+  if(HOME) pts.push(HOME);
+  for(const p of mapPoints.rx) pts.push(p);
+  for(const p of mapPoints.qso) pts.push(p);
+  if(mapPoints.tx) pts.push(mapPoints.tx);
+ }
  if(!pts.length) return {x:0,y:0,w:MW,h:MH};
  let minX=Math.min.apply(null,pts.map(p=>p[0])), maxX=Math.max.apply(null,pts.map(p=>p[0]));
  let minY=Math.min.apply(null,pts.map(p=>p[1])), maxY=Math.max.apply(null,pts.map(p=>p[1]));
@@ -491,7 +656,19 @@ function computeBBox(){
  if(x+w>MW)x=MW-w; if(y+h>MH)y=MH-h;
  return {x,y,w,h};
 }
-function updateMapZoom(){ if(mapMode==='auto') animateViewBoxTo(computeBBox()); }
+/* ---- while calling/mid-QSO with a target, zoom tight to just HOME + that
+   target instead of the full heard/worked point cloud -- makes the beam/line
+   to whoever we're actively pursuing the obvious focus. renderTX() clears
+   mapPoints.tx the moment state leaves calling/qso, so this naturally zooms
+   back out to the full picture on its own once we move to the next target. ---- */
+function computeTargetBBox(){
+ const pts=[]; if(HOME) pts.push(HOME); if(mapPoints.tx) pts.push(mapPoints.tx);
+ return computeBBox(pts.length?pts:null);
+}
+function updateMapZoom(){
+ if(mapMode!=='auto') return;
+ animateViewBoxTo(mapPoints.tx?computeTargetBBox():computeBBox());
+}
 function setMapMode(m){
  mapMode=m;
  document.getElementById('mapAuto').classList.toggle('active', m==='auto');
@@ -673,8 +850,8 @@ function renderQSOs(s){
 }
 function renderTX(e){
  const g=document.getElementById('tx');
- if(!e||!HOME||!(e.state==='calling'||e.state==='qso')||!e.grid){g.innerHTML='';mapPoints.tx=null;updateMapZoom();return;}
- const ll=grid2ll(e.grid); if(!ll){g.innerHTML='';mapPoints.tx=null;updateMapZoom();return;}
+ if(!e||!HOME||!(e.state==='calling'||e.state==='qso')||!e.target){g.innerHTML='';mapPoints.tx=null;updateMapZoom();return;}
+ const ll=targetLatLon(e.target,e.grid); if(!ll){g.innerHTML='';mapPoints.tx=null;updateMapZoom();return;}
  const [x2,y2]=ll2xy(ll), [x1,y1]=HOME;
  mapPoints.tx=[x2,y2];
  const bow=Math.min(80,Math.hypot(x2-x1,y2-y1)*0.25)+8;   // quadratic, bowed poleward
@@ -749,6 +926,12 @@ function updateTxPanel(e, tx, st){
    refreshActionsState's /actions/state poll) — otherwise force IDLE. ---- */
 const STATE_LABELS={hunting:'AUTO-CQ',calling:'CALLING',qso:'QSO',tx_abort:'TX ABORT',
  done:'DONE',logged:'LOGGED',breather:'BREATHER'};
+/* ---- QSO STEP: qso.py's own inner state machine (call -> rrpt -> b73 ->
+   done), mirrored via engine.json's qso_step field -- a real 1-of-4 count
+   of exactly how far the current exchange has gotten, not a guess. ---- */
+const QSO_STEPS={call:{n:1,label:'calling'},rrpt:{n:2,label:'exchanging report'},
+ b73:{n:3,label:'confirmed — sending 73'}};
+const QSO_STEP_TOTAL=4;
 async function engTick(){
  let e=null;
  try{
@@ -771,6 +954,27 @@ async function engTick(){
  document.getElementById('btnUnkey').classList.toggle('live',tx);
  updateNextTx(e,tx,st);
  updateTxPanel(e,tx,st);
+ // CALLING cockpit item: where the current target actually is -- US state
+ // (from their grid) for domestic contacts, country for everyone else.
+ // Orange while pursuing, upgrades to pulsing red only when tx===true --
+ // red is reserved for "actually on air right now" everywhere in this UI.
+ const callingEl=document.getElementById('cpCalling');
+ const pursuing=chaserRunning && (st==='calling'||st==='qso');
+ if(pursuing && e&&e.target){
+  callingEl.textContent=callLocation(e.target,e.grid)||e.target;
+ }else{
+  callingEl.textContent='—';
+ }
+ callingEl.classList.toggle('tx-live',tx);
+ const stepEl=document.getElementById('cpQsoStep');
+ const step=pursuing && e && QSO_STEPS[e.qso_step];
+ if(step){
+  stepEl.textContent=`${step.n} of ${QSO_STEP_TOTAL} — ${step.label}`;
+  stepEl.classList.add('active');
+ }else{
+  stepEl.textContent='—';
+  stepEl.classList.remove('active');
+ }
  /* ---- alerts (4.3): chase ended / watchdog-abort — edge-triggered off
     engine.json's state field so a steady state never re-fires ---- */
  const stl=st.toLowerCase();
@@ -916,6 +1120,32 @@ function wireActions(){
   btn.disabled=false;
   setActionsMsg(r.ok?('UNKEY sent — PTT readback: '+(r.body.ptt!=null?r.body.ptt:'?')):'UNKEY FAILED: '+(r.body.error||r.error||r.status));
   refreshActionsState();
+ });
+ // TUNE 4 30s: stop Automatic CQ + unkey (same tested /action/unkey the STOP
+ // button uses -- no new radio-facing code), then a visible 30 s window for
+ // a manual TUNE cycle. Deliberately does NOT auto-resume the chase after
+ // the window -- that would be re-starting TX without a fresh explicit go;
+ // the operator clicks Automatic CQ again once actually done tuning.
+ document.getElementById('btnTune30').addEventListener('click',async()=>{
+  const btn=document.getElementById('btnTune30');
+  if(btn.disabled) return;
+  btn.disabled=true;
+  const r=await postAction('/action/unkey',{});
+  setActionsMsg(r.ok?'stopped for TUNE — 30s window starting':'stop failed: '+(r.body.error||r.error||r.status));
+  refreshActionsState();
+  let secs=30;
+  btn.textContent=`TUNING… ${secs}s`;
+  const iv=setInterval(()=>{
+   secs--;
+   if(secs<=0){
+    clearInterval(iv);
+    btn.textContent='TUNE';
+    btn.disabled=false;
+    setActionsMsg('tune window done — click Automatic CQ when ready');
+   }else{
+    btn.textContent=`TUNING… ${secs}s`;
+   }
+  },1000);
  });
  // target pick/skip: event delegation since #next/#cand are re-rendered every tick
  document.getElementById('opsBody').addEventListener('click',async e=>{

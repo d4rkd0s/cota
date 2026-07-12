@@ -52,7 +52,11 @@ _engine = {"utc": "", "state": "init", "target": None, "grid": None,
            # panel. Deliberately separate from "msg" above, which doubles as a
            # transient status/reason string (also used for tx_abort reasons) —
            # tx_msg must never show a stale abort reason as if it were content.
-           "tx_msg": None, "tx_offset": None}
+           "tx_msg": None, "tx_offset": None,
+           # qso_step: the inner state machine's own "call"/"rrpt"/"b73"
+           # value, mirrored for the dashboard's step-of-4 progress display.
+           # Display only — nothing reads this back into control flow.
+           "qso_step": None}
 
 def write_engine_state(**kw):
     """Publish engine state for the dashboard map. Atomic (tmp + os.replace);
@@ -519,6 +523,7 @@ def main():
         their_freq = d["freq"]
         answered_f0 = None        # offset that actually got through (sticky once answered)
         while state not in ("done", "fail"):
+            write_engine_state(qso_step=state)
             if skip_is_requested(_read_skip_ts_epoch(), target_start_ts):
                 ev(f"skip requested for {call} — abandoning target")
                 state = "fail"
